@@ -29,7 +29,7 @@ pub const ALPN: &[u8] = b"linxiv/sync/0";
 pub(crate) const REFUSED_CODE: u32 = 1;
 
 /// Largest accepted sync frame.
-// ponytail: 64 MiB cap on untrusted frame lengths; raise if project docs outgrow it.
+//Chosen limitation: 64 MiB cap on untrusted frame lengths; raise if project docs outgrow it.
 const MAX_FRAME: u64 = 64 * 1024 * 1024;
 
 /// Deadline for one complete frame to arrive. Bounds both the silent peer and
@@ -58,7 +58,7 @@ impl DeviceIdentity {
         Self::load_or_generate_at(path.as_ref(), None)
     }
 
-    // vendor-edit: DEK-wrapped device key at rest (write-enforcement spec §8).
+    // DEK-wrapped device key at rest (write-enforcement spec §8).
     /// Like [`Self::load_or_generate`], but with `Some(dek)` the key file is
     /// AEAD-wrapped (XChaCha20-Poly1305) under the DEK; a legacy plaintext
     /// file is rewritten encrypted once. An encrypted file loaded without
