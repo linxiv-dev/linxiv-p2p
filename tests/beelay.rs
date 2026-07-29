@@ -1287,3 +1287,180 @@ async fn bad_host_ticket_errors_typed() -> Result<()> {
     node.shutdown().await.map_err(anyhow::Error::msg)?;
     Ok(())
 }
+
+/// The parked-invite map on disk, as `sync_project` will read it back.
+fn parked(data_dir: &std::path::Path) -> Vec<(String, String)> {
+    let path = data_dir.join("pending.bin");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    postcard::from_bytes(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// Accepting an invite the host cannot answer is not a failure: the project is
+/// registered empty, the invite is parked on disk, and the park survives a
+/// restart so the join can finish whenever the host turns up.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_accept_parks_invite() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (alice_device, alice_auth_id) = identities(dir.path(), "alice");
+    let (bob_device, bob_auth_id) = identities(dir.path(), "bob");
+    let bob_data = dir.path().join("bob-data");
+    let bob_auth_dir = dir.path().join("bob-auth");
+    std::fs::create_dir_all(&bob_data)?;
+    let alice_auth = ProjectAuth::new(&alice_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_auth = ProjectAuth::load_or_new(&bob_auth_id, &bob_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_member = alice_auth
+        .receive_contact_card(&bob_auth.contact_card().await.map_err(anyhow::Error::msg)?)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let alice = BeelayNode::bind_local(&alice_device, &alice_auth_id, alice_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, Some(&bob_data))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut doc = Automerge::new();
+    put(&mut doc, "title", "Offline Join");
+    alice
+        .create_shared_project("proj", doc)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    alice
+        .auth()
+        .add_member("proj", bob_member, Role::Edit)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let invite = alice
+        .invite("proj", bob_member)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    // the host goes away before bob ever gets to paste it
+    alice.shutdown().await.map_err(anyhow::Error::msg)?;
+
+    let project_id = bob
+        .accept_invite(&invite)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(project_id, "proj");
+
+    // registered, but empty and NOT adopted: the delegations never arrived
+    let bob_doc = bob.doc("proj").await.expect("project registered");
+    assert_eq!(get_str(&bob_doc, "title"), None);
+    assert!(
+        bob.auth().doc_id("proj").is_none(),
+        "an unreachable host must not produce an adoption"
+    );
+    assert_eq!(
+        parked(&bob_data),
+        vec![("proj".to_string(), invite.clone())],
+        "the invite should be parked for a later sync"
+    );
+
+    // a sync while the host is still down keeps the park intact
+    assert!(bob.sync_project("proj").await.is_err());
+    assert_eq!(parked(&bob_data).len(), 1, "a failed sync must not drop it");
+
+    bob.shutdown().await.map_err(anyhow::Error::msg)?;
+    let bob_auth = ProjectAuth::load_or_new(&bob_auth_id, &bob_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, Some(&bob_data))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        parked(&bob_data),
+        vec![("proj".to_string(), invite)],
+        "the park must survive a restart"
+    );
+    bob.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// A parked invite is carried into the next sync and dropped once that sync
+/// lands. Forges pending.bin over an already-joined node because bind_local has
+/// no stable address: a genuinely deferred accept records a host address that a
+/// restarted host no longer holds (the real presets::N0 build dials through a
+/// relay keyed on the endpoint id, so it does not have that problem).
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_invite_drains_on_sync() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (alice_device, alice_auth_id) = identities(dir.path(), "alice");
+    let (bob_device, bob_auth_id) = identities(dir.path(), "bob");
+    let bob_data = dir.path().join("bob-data");
+    let bob_auth_dir = dir.path().join("bob-auth");
+    std::fs::create_dir_all(&bob_data)?;
+    let alice_auth = ProjectAuth::new(&alice_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_auth = ProjectAuth::load_or_new(&bob_auth_id, &bob_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_member = alice_auth
+        .receive_contact_card(&bob_auth.contact_card().await.map_err(anyhow::Error::msg)?)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let alice = BeelayNode::bind_local(&alice_device, &alice_auth_id, alice_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, Some(&bob_data))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut doc = Automerge::new();
+    put(&mut doc, "title", "Drain Me");
+    alice
+        .create_shared_project("proj", doc)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    alice
+        .auth()
+        .add_member("proj", bob_member, Role::Edit)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let invite = alice
+        .invite("proj", bob_member)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    bob.accept_invite(&invite)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(parked(&bob_data).is_empty(), "a live accept parks nothing");
+
+    // park it behind bob's back, then restart so the map is loaded from disk
+    bob.shutdown().await.map_err(anyhow::Error::msg)?;
+    std::fs::write(
+        bob_data.join("pending.bin"),
+        postcard::to_stdvec(&vec![("proj".to_string(), invite)])?,
+    )?;
+    let bob_auth = ProjectAuth::load_or_new(&bob_auth_id, &bob_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, Some(&bob_data))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let outcome = bob.sync_project("proj").await.map_err(anyhow::Error::msg)?;
+    assert!(
+        outcome.undecryptable.is_empty(),
+        "{:?}",
+        outcome.undecryptable
+    );
+    let bob_doc = bob.doc("proj").await.unwrap();
+    assert_eq!(get_str(&bob_doc, "title").as_deref(), Some("Drain Me"));
+    assert!(
+        parked(&bob_data).is_empty(),
+        "a landed sync must drop the park"
+    );
+
+    for node in [alice, bob] {
+        node.shutdown().await.map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}

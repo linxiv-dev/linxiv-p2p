@@ -68,6 +68,14 @@ const TAG_BEELAY: u8 = 0;
 /// Frame tag: keyhive preamble payload (contact card or static events).
 const TAG_KEYHIVE: u8 = 1;
 
+// vendor-edit: bound the dial so an unreachable host parks the invite promptly
+// instead of hanging on the QUIC handshake. Deliberately well under the app's
+// 60s share-API budget: a timeout there aborts `accept_invite` mid-dial and
+// parks nothing, which is the failure this whole path exists to avoid. A
+// relay-assisted handshake takes seconds, and a premature park is cheap — the
+// next sync retries it — so this errs short.
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 // --- change <-> commit mapping ----------------------------------------------
 
 /// Changes in `doc` that have no commit yet, ordered deps-before-dependents
@@ -185,6 +193,23 @@ impl fmt::Display for HostTicketError {
 }
 
 impl std::error::Error for HostTicketError {}
+
+// vendor-edit: the dial never landed. Distinguished from every other join
+// failure because it is the one that says nothing about whether this peer is
+// welcome — the invite is still good, the host is just not answering — so
+// `accept_invite` parks the invite instead of failing. Wrapped as the direct
+// [`AnyError`] payload for `downcast_ref::<HostUnreachable>()`, same pattern
+// as `HostTicketError`.
+#[derive(Debug)]
+pub struct HostUnreachable(String);
+
+impl fmt::Display for HostUnreachable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "could not reach the host: {}", self.0)
+    }
+}
+
+impl std::error::Error for HostUnreachable {}
 
 // --- invite ------------------------------------------------------------------
 
@@ -708,6 +733,13 @@ struct Shared {
     // registry writes happen off the state lock; this lock keeps them one at
     // a time (it is acquired before the state guard drops).
     registry_write: Mutex<()>,
+    // vendor-edit: project id -> invite string, for accepts whose dial failed.
+    // Its own file rather than a registry.bin field because that layout is
+    // compat-locked (see RegistryHost). `sync_project` drains an entry once
+    // the adoption it was holding finally lands.
+    pending_path: Option<PathBuf>,
+    pending: std::sync::Mutex<HashMap<String, String>>,
+    pending_write: Mutex<()>,
     // endpoint -> keyhive member, learned from binding-verified preambles and
     // persisted with the registry; the blobs gate resolves dialers through it.
     peers: std::sync::Mutex<HashMap<EndpointId, MemberId>>,
@@ -737,6 +769,10 @@ type RegistryEntry = (String, [u8; 16], RegistryHost);
 /// registry.bin payload: project entries plus the peer map
 /// (endpoint id bytes -> member id bytes).
 type RegistryFile = (Vec<RegistryEntry>, Vec<([u8; 32], [u8; 32])>);
+/// pending.bin payload: (project id, invite string) for un-landed accepts.
+/// The invite string is stored whole — it already carries every id the
+/// deferred adoption needs, so there is no second format to keep in step.
+type PendingFile = Vec<(String, String)>;
 
 impl Shared {
     async fn project_ids(&self) -> Vec<String> {
@@ -780,6 +816,40 @@ impl Shared {
             .map_err(|e| anyerr!("registry write task: {e}"))?;
         drop(write_guard);
         result
+    }
+
+    /// Writes the parked-invite map. Called after it changes; a failure here
+    /// costs the retry-after-restart, not the in-memory state, so callers log
+    /// rather than abort.
+    async fn persist_pending(&self) -> Result<()> {
+        let Some(path) = &self.pending_path else {
+            return Ok(());
+        };
+        let entries: PendingFile = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, invite)| (id.clone(), invite.clone()))
+            .collect();
+        let bytes =
+            postcard::to_stdvec(&entries).map_err(|e| anyerr!("encoding pending invites: {e}"))?;
+        let path = path.clone();
+        let _guard = self.pending_write.lock().await;
+        tokio::task::spawn_blocking(move || write_file(&path, &bytes))
+            .await
+            .map_err(|e| anyerr!("pending invite write task: {e}"))?
+    }
+
+    /// Drops a parked invite — its adoption landed, or a fresh accept replaced
+    /// it. No-op when nothing was parked.
+    async fn clear_pending(&self, project_id: &str) {
+        if self.pending.lock().unwrap().remove(project_id).is_none() {
+            return;
+        }
+        if let Err(e) = self.persist_pending().await {
+            eprintln!("beelay: clearing parked invite for {project_id}: {e}");
+        }
     }
 
     /// Encrypts every not-yet-flushed local change into a beelay commit.
@@ -1216,12 +1286,31 @@ impl BeelayNode {
                 Err(e) => eprintln!("beelay: malformed project registry, starting empty: {e}"),
             }
         }
+        // parked invites survive a restart — that is the whole point of
+        // writing them down. A malformed file starts empty like the registry:
+        // the user can always re-paste the invite.
+        let pending_path = data_dir.map(|d| d.join("pending.bin"));
+        let mut pending = HashMap::new();
+        if let Some(path) = &pending_path
+            && path.exists()
+        {
+            match std::fs::read(path)
+                .map_err(|e| anyerr!("{e}"))
+                .and_then(|b| postcard::from_bytes::<PendingFile>(&b).map_err(|e| anyerr!("{e}")))
+            {
+                Ok(entries) => pending.extend(entries),
+                Err(e) => eprintln!("beelay: malformed pending invites, starting empty: {e}"),
+            }
+        }
         let shared = Arc::new(Shared {
             auth,
             peer_id,
             binding,
             registry_path,
             registry_write: Mutex::new(()),
+            pending_path,
+            pending: std::sync::Mutex::new(pending),
+            pending_write: Mutex::new(()),
             peers: std::sync::Mutex::new(peers),
             state: Mutex::new(State { core, projects }),
         });
@@ -1352,17 +1441,20 @@ impl BeelayNode {
     /// the content.
     ///
     /// This dials the host — the invite carries no keyhive events, so the
-    /// session preamble is where the delegations come from. Consequences: the
-    /// host must be reachable, a host that refuses this peer (never granted,
-    /// or revoked) fails here rather than on a later sync, and a failed accept
-    /// leaves no local trace of the project.
+    /// session preamble is where the delegations come from. Two consequences:
+    ///
+    /// - A host that **refuses** this peer (never granted, or revoked) fails
+    ///   here rather than on a later sync, and leaves no local trace.
+    /// - A host that is merely **unreachable** does NOT fail. The invite says
+    ///   nothing about whether the peer is welcome, so it is parked on disk
+    ///   and this returns `Ok`; the next [`Self::sync_project`] finishes the
+    ///   adoption. Pasting an invite offline is therefore a supported flow —
+    ///   the project exists locally, empty, until the host answers.
     ///
     /// Re-accepting a known project (retry, rejoin after leave) refreshes the
     /// host address without touching its doc.
-    pub async fn accept_invite(&self, invite: &str) -> Result<String> {
-        let invite: ProjectInvite = invite
-            .parse()
-            .map_err(|e| anyerr!("malformed invite: {e}"))?;
+    pub async fn accept_invite(&self, raw: &str) -> Result<String> {
+        let invite: ProjectInvite = raw.parse().map_err(|e| anyerr!("malformed invite: {e}"))?;
         let host = ProjectHost::Member(invite.endpoint.endpoint_addr().clone());
         // register before dialing — sync_project reads this entry to find the
         // host. The lock covers check + insert only; the dial must not hold it.
@@ -1400,10 +1492,31 @@ impl BeelayNode {
             !known
         };
         match self
-            .sync_project_inner(&invite.project_id, Some((invite.keyhive_doc, invite.group)))
+            .sync_project_inner(
+                &invite.project_id,
+                Some((invite.keyhive_doc, invite.group)),
+                false,
+            )
             .await
         {
-            Ok(_) => Ok(invite.project_id),
+            Ok(_) => {
+                // a previous offline accept may have parked this same invite.
+                self.shared.clear_pending(&invite.project_id).await;
+                Ok(invite.project_id)
+            }
+            // the host never answered, which says nothing about whether we are
+            // welcome: keep the registration, park the invite, report success.
+            Err(JoinError::Other(e)) if e.downcast_ref::<HostUnreachable>().is_some() => {
+                self.shared
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .insert(invite.project_id.clone(), raw.to_owned());
+                if let Err(e) = self.shared.persist_pending().await {
+                    eprintln!("beelay: parking invite for {}: {e}", invite.project_id);
+                }
+                Ok(invite.project_id)
+            }
             Err(e) => {
                 // never unregister a project that predated this call — only
                 // the entry this call inserted.
@@ -1442,22 +1555,46 @@ impl BeelayNode {
     /// CGKA ops the encryption produced. A host that closes the connection
     /// with the refusal code (this peer holds no role on the requested
     /// project, e.g. revoked) surfaces as [`JoinError::Refused`].
+    ///
+    /// Also where an accept that could not reach the host finishes: a parked
+    /// invite is carried into this session, so the first sync that connects
+    /// completes the join and fetches the content together.
     pub async fn sync_project(
         &self,
         project_id: &str,
     ) -> std::result::Result<SyncOutcome, JoinError> {
-        self.sync_project_inner(project_id, None).await
+        let parked = self.shared.pending.lock().unwrap().get(project_id).cloned();
+        let adopt = match &parked {
+            None => None,
+            Some(raw) => match raw.parse::<ProjectInvite>() {
+                Ok(invite) => Some((invite.keyhive_doc, invite.group)),
+                // unreadable park file: sync anyway (undecryptable commits
+                // surface in the outcome) and leave it for a re-paste.
+                Err(e) => {
+                    eprintln!("beelay: parked invite for {project_id} is unreadable: {e}");
+                    None
+                }
+            },
+        };
+        let outcome = self.sync_project_inner(project_id, adopt, true).await?;
+        if adopt.is_some() {
+            self.shared.clear_pending(project_id).await;
+        }
+        Ok(outcome)
     }
 
-    /// One session against the project's host. `adopt` carries an invite's
-    /// `(keyhive_doc, group)`: the joining path, which runs the preamble for
-    /// the host's delegation events, adopts the doc, and stops there — it
-    /// transfers no content, so the caller's [`Self::sync_project`] is still
-    /// the call that fetches (and reports) it.
+    /// One session against the project's host.
+    ///
+    /// `adopt` carries an invite's `(keyhive_doc, group)` for the joining path,
+    /// adopted once the preamble has ingested the host's delegation events.
+    /// `sync_content` runs the sedimentree exchange; `accept_invite` turns it
+    /// off so [`Self::sync_project`] stays the call that fetches (and reports)
+    /// the content.
     async fn sync_project_inner(
         &self,
         project_id: &str,
         adopt: Option<([u8; 32], [u8; 32])>,
+        sync_content: bool,
     ) -> std::result::Result<SyncOutcome, JoinError> {
         let (beelay_doc, host, unhealthy) = {
             let state = self.shared.state.lock().await;
@@ -1484,16 +1621,26 @@ impl BeelayNode {
             (proj.beelay_doc, host, proj.unhealthy)
         };
         // an unhealthy doc is download-only; the refresh below can clear it.
-        if !unhealthy {
+        // A pending adoption cannot flush either: encrypting needs the keyhive
+        // doc this session is about to adopt. Edits made while a join was
+        // parked therefore upload on the sync after this one.
+        if !unhealthy && adopt.is_none() {
             self.shared.flush(project_id).await?;
         }
 
-        let conn = self
-            .router
-            .endpoint()
-            .connect(host, BEELAY_ALPN)
-            .await
-            .context("dialing beelay host")?;
+        // typed so accept_invite can tell "host is offline" (park the invite)
+        // from "host said no" (fail, and leave nothing behind).
+        let unreachable = |e: String| JoinError::Other(AnyError::from_std(HostUnreachable(e)));
+        let conn = match tokio::time::timeout(
+            DIAL_TIMEOUT,
+            self.router.endpoint().connect(host, BEELAY_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => return Err(unreachable(e.to_string())),
+            Err(_) => return Err(unreachable(format!("no answer within {DIAL_TIMEOUT:?}"))),
+        };
         let session = async {
             let (mut send, mut recv) = conn.open_bi().await.std_context("opening beelay stream")?;
             send_frame(&mut send, project_id.as_bytes()).await?;
@@ -1527,9 +1674,9 @@ impl BeelayNode {
             )
             .await?;
 
-            // an adopting session wants only the preamble's events; it says bye
-            // straight away and leaves the content to the caller's sync_project.
-            if adopt.is_none() {
+            // an accept wants only the preamble's events; it says bye straight
+            // away and leaves the content to the caller's sync_project.
+            if sync_content {
                 // pump the sync story to completion; the lock is taken per event.
                 // The round cap bounds a host that keeps answering without ever
                 // letting the story converge.
