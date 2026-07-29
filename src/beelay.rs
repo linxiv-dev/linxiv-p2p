@@ -1548,6 +1548,14 @@ impl BeelayNode {
         state.projects.get(project_id).map(|p| p.doc.fork())
     }
 
+    /// True while an [`Self::accept_invite`] for `project_id` is still parked
+    /// because the host could not be reached: the project is registered but
+    /// unadopted and its doc is empty. The next [`Self::sync_project`] that
+    /// connects clears it.
+    pub fn join_pending(&self, project_id: &str) -> bool {
+        self.shared.pending.lock().unwrap().contains_key(project_id)
+    }
+
     /// Dials the project's host and runs one full session: keyhive preamble,
     /// beelay handshake, bidirectional sedimentree sync (local commits
     /// upload, remote commits download), then decrypt-and-apply. Local edits
