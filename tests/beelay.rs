@@ -570,11 +570,12 @@ async fn kv_restart_keeps_doc() -> Result<()> {
     Ok(())
 }
 
-/// The accept side refuses peers with no role on the requested project: a
-/// leaked invite lets a stranger adopt locally, but the host closes the sync
-/// before serving; the invited member is unaffected.
+/// The accept side refuses peers with no role on the requested project. Since
+/// the delegations arrive over the session rather than in the invite string, a
+/// stranger holding a leaked invite cannot even adopt: the host closes the
+/// session and the failed accept rolls back. The invited member is unaffected.
 #[tokio::test(flavor = "multi_thread")]
-async fn stranger_sync_refused() -> Result<()> {
+async fn stranger_accept_refused() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (alice_device, alice_auth_id) = identities(dir.path(), "alice");
     let (bob_device, bob_auth_id) = identities(dir.path(), "bob");
@@ -590,11 +591,6 @@ async fn stranger_sync_refused() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     let bob_card = bob_auth.contact_card().await.map_err(anyhow::Error::msg)?;
     let bob_member = alice_auth
-        .receive_contact_card(&bob_card)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    // mallory knows bob's (public) card too — the invite's events reference it
-    mallory_auth
         .receive_contact_card(&bob_card)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -624,19 +620,19 @@ async fn stranger_sync_refused() -> Result<()> {
         .await
         .map_err(anyhow::Error::msg)?;
 
-    // mallory got the invite string but was never granted: adopting locally
-    // works, the host refuses to serve.
-    mallory
+    // mallory got the invite string but was never granted: the accept dials,
+    // the host refuses before serving anything, and the rollback leaves her
+    // with no project at all.
+    let err = mallory
         .accept_invite(&invite)
         .await
-        .map_err(anyhow::Error::msg)?;
-    let res = mallory.sync_project("proj").await;
+        .expect_err("stranger accepted a leaked invite")
+        .to_string();
+    assert!(err.contains("refused"), "{err}");
     assert!(
-        matches!(res, Err(linxiv_p2p::sync::JoinError::Refused)),
-        "{res:?}"
+        mallory.doc("proj").await.is_none(),
+        "a refused accept left a project behind"
     );
-    let mallory_doc = mallory.doc("proj").await.unwrap();
-    assert_eq!(get_str(&mallory_doc, "title"), None);
 
     // the invited member still syncs
     bob.accept_invite(&invite)
@@ -718,6 +714,17 @@ async fn viewer_cannot_write() -> Result<()> {
         .invite("proj", carol_member)
         .await
         .map_err(anyhow::Error::msg)?;
+
+    // an invite carries ids and an address, never the keyhive event export —
+    // that grew ~900 chars per member and ~4k per key rotation, unbounded.
+    // Two members are granted here, so a regression shows up immediately.
+    for (who, invite) in [("bob", &bob_invite), ("carol", &carol_invite)] {
+        assert!(
+            invite.len() < 500,
+            "{who}'s invite is {} chars; is the event export back?",
+            invite.len()
+        );
+    }
 
     // bob (Read) pulls the content, edits his mirror, and syncs again: the
     // whole flow must complete — serve-only is not refused — but his upload

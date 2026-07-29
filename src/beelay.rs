@@ -188,12 +188,17 @@ impl std::error::Error for HostTicketError {}
 
 // --- invite ------------------------------------------------------------------
 
-/// A pasteable invite for one member: host address, project/doc ids, and the
-/// keyhive delegation events that member needs.
+/// A pasteable invite for one member: host address and the project/doc ids.
 ///
 /// Create it with [`BeelayNode::invite`] AFTER granting the member via
 /// [`ProjectAuth::add_member`] — content is encrypted at invite time so it
 /// lands in an epoch the member can read (grant-before-encrypt, keyhive #136).
+///
+/// The keyhive delegation events the joiner needs are NOT in here: the
+/// session preamble already exports the same bytes on every connection
+/// (see `keyhive_preamble`), so [`BeelayNode::accept_invite`] dials and
+/// adopts from those instead. Inlining them made the string grow without
+/// bound — ~900 chars per member and ~4k per key rotation, forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInvite {
     endpoint: EndpointTicket,
@@ -203,7 +208,6 @@ pub struct ProjectInvite {
     // vendor-edit: membership group rides the invite so the invitee can manage
     // membership (per its granted role) after adopting.
     group: [u8; 32],
-    events: Vec<u8>,
 }
 
 impl ProjectInvite {
@@ -223,21 +227,18 @@ impl Ticket for ProjectInvite {
             self.beelay_doc,
             self.keyhive_doc,
             self.group,
-            &self.events,
         ))
         .expect("postcard serialization failed")
     }
 
     fn decode_bytes(bytes: &[u8]) -> std::result::Result<Self, ParseError> {
-        let (endpoint, project_id, beelay_doc, keyhive_doc, group, events) =
-            postcard::from_bytes(bytes)?;
+        let (endpoint, project_id, beelay_doc, keyhive_doc, group) = postcard::from_bytes(bytes)?;
         Ok(Self {
             endpoint,
             project_id,
             beelay_doc,
             keyhive_doc,
             group,
-            events,
         })
     }
 }
@@ -1304,7 +1305,20 @@ impl BeelayNode {
     /// after the grant, so the invitee can decrypt everything it will fetch.
     pub async fn invite(&self, project_id: &str, member: MemberId) -> Result<String> {
         self.shared.flush(project_id).await?;
-        let events = self.shared.auth.export_events_for(member).await?;
+        // the grant used to be implicit in the event export; check it here so
+        // inviting before add_member fails at mint time, not at the joiner's
+        // first dial.
+        if self
+            .shared
+            .auth
+            .query_access(project_id, member)
+            .await?
+            .is_none()
+        {
+            return Err(anyerr!(
+                "member holds no role on {project_id}; add_member first"
+            ));
+        }
         let keyhive_doc = self
             .shared
             .auth
@@ -1329,72 +1343,80 @@ impl BeelayNode {
             beelay_doc,
             keyhive_doc,
             group,
-            events,
         };
         Ok(invite.encode_string())
     }
 
-    /// Ingests an invite: learns the delegations, adopts the keyhive doc,
-    /// and registers an empty local doc wired to the host's address. Returns
-    /// the project id; call [`Self::sync_project`] to fetch the content.
-    /// Re-accepting a known project (retry, rejoin after leave) re-ingests
-    /// the events and refreshes the host address without touching its doc.
+    /// Registers the project against the host's address, adopts the keyhive
+    /// doc, and returns the project id; call [`Self::sync_project`] to fetch
+    /// the content.
+    ///
+    /// This dials the host — the invite carries no keyhive events, so the
+    /// session preamble is where the delegations come from. Consequences: the
+    /// host must be reachable, a host that refuses this peer (never granted,
+    /// or revoked) fails here rather than on a later sync, and a failed accept
+    /// leaves no local trace of the project.
+    ///
+    /// Re-accepting a known project (retry, rejoin after leave) refreshes the
+    /// host address without touching its doc.
     pub async fn accept_invite(&self, invite: &str) -> Result<String> {
         let invite: ProjectInvite = invite
             .parse()
             .map_err(|e| anyerr!("malformed invite: {e}"))?;
-        // the lock is held across check + ingest + adopt + insert
-        // (ingest/adopt are local keyhive compute — no network awaits).
-        let mut state = self.shared.state.lock().await;
-        self.shared.auth.ingest_events(&invite.events).await?;
-        if let Some(proj) = state.projects.get_mut(&invite.project_id) {
-            if matches!(proj.host, ProjectHost::Hosted) {
-                return Err(anyerr!(
-                    "this node hosts project {}; refusing an invite for it",
-                    invite.project_id
-                ));
-            }
-            if DocumentId::from(invite.beelay_doc) != proj.beelay_doc {
-                return Err(anyerr!(
-                    "invite beelay doc does not match known project {}",
-                    invite.project_id
-                ));
-            }
-            match self.shared.auth.doc_id(&invite.project_id) {
-                Some(doc) if doc != invite.keyhive_doc => {
+        let host = ProjectHost::Member(invite.endpoint.endpoint_addr().clone());
+        // register before dialing — sync_project reads this entry to find the
+        // host. The lock covers check + insert only; the dial must not hold it.
+        let fresh = {
+            let mut state = self.shared.state.lock().await;
+            let known = state.projects.contains_key(&invite.project_id);
+            if let Some(proj) = state.projects.get_mut(&invite.project_id) {
+                if matches!(proj.host, ProjectHost::Hosted) {
                     return Err(anyerr!(
-                        "invite keyhive doc does not match known project {}",
+                        "this node hosts project {}; refusing an invite for it",
                         invite.project_id
                     ));
                 }
-                Some(_) => {}
-                None => {
-                    self.shared
-                        .auth
-                        .adopt_project(&invite.project_id, invite.keyhive_doc, Some(invite.group))
-                        .await?;
+                if DocumentId::from(invite.beelay_doc) != proj.beelay_doc {
+                    return Err(anyerr!(
+                        "invite beelay doc does not match known project {}",
+                        invite.project_id
+                    ));
                 }
+                proj.host = host;
+            } else {
+                state.projects.insert(
+                    invite.project_id.clone(),
+                    ProjectState {
+                        doc: Automerge::new(),
+                        beelay_doc: DocumentId::from(invite.beelay_doc),
+                        host,
+                        change_to_commit: HashMap::new(),
+                        applied: HashSet::new(),
+                        unhealthy: false,
+                    },
+                );
             }
-            proj.host = ProjectHost::Member(invite.endpoint.endpoint_addr().clone());
-        } else {
-            self.shared
-                .auth
-                .adopt_project(&invite.project_id, invite.keyhive_doc, Some(invite.group))
-                .await?;
-            state.projects.insert(
-                invite.project_id.clone(),
-                ProjectState {
-                    doc: Automerge::new(),
-                    beelay_doc: DocumentId::from(invite.beelay_doc),
-                    host: ProjectHost::Member(invite.endpoint.endpoint_addr().clone()),
-                    change_to_commit: HashMap::new(),
-                    applied: HashSet::new(),
-                    unhealthy: false,
-                },
-            );
+            self.shared.persist_registry(state).await?;
+            !known
+        };
+        match self
+            .sync_project_inner(&invite.project_id, Some((invite.keyhive_doc, invite.group)))
+            .await
+        {
+            Ok(_) => Ok(invite.project_id),
+            Err(e) => {
+                // never unregister a project that predated this call — only
+                // the entry this call inserted.
+                if fresh {
+                    let mut state = self.shared.state.lock().await;
+                    state.projects.remove(&invite.project_id);
+                    if let Err(e) = self.shared.persist_registry(state).await {
+                        eprintln!("beelay: rolling back a failed accept: {e}");
+                    }
+                }
+                Err(AnyError::from_std(e))
+            }
         }
-        self.shared.persist_registry(state).await?;
-        Ok(invite.project_id)
     }
 
     /// Runs `f` on the local plaintext document. `None` if unknown.
@@ -1423,6 +1445,19 @@ impl BeelayNode {
     pub async fn sync_project(
         &self,
         project_id: &str,
+    ) -> std::result::Result<SyncOutcome, JoinError> {
+        self.sync_project_inner(project_id, None).await
+    }
+
+    /// One session against the project's host. `adopt` carries an invite's
+    /// `(keyhive_doc, group)`: the joining path, which runs the preamble for
+    /// the host's delegation events, adopts the doc, and stops there — it
+    /// transfers no content, so the caller's [`Self::sync_project`] is still
+    /// the call that fetches (and reports) it.
+    async fn sync_project_inner(
+        &self,
+        project_id: &str,
+        adopt: Option<([u8; 32], [u8; 32])>,
     ) -> std::result::Result<SyncOutcome, JoinError> {
         let (beelay_doc, host, unhealthy) = {
             let state = self.shared.state.lock().await;
@@ -1492,44 +1527,49 @@ impl BeelayNode {
             )
             .await?;
 
-            // pump the sync story to completion; the lock is taken per event.
-            // The round cap bounds a host that keeps answering without ever
-            // letting the story converge.
-            let (story, event) = Event::sync_doc(beelay_doc, connected.their_peer_id().clone());
-            let mut msgs = self
-                .shared
-                .state
-                .lock()
-                .await
-                .core
-                .drive_scoped(event, Some(beelay_doc))?;
-            let mut rounds = 0usize;
-            loop {
-                send_envelopes(&connected, msgs, &mut send).await?;
-                if let Some(result) = self.shared.state.lock().await.core.stories.remove(&story) {
-                    let StoryResult::SyncDoc(_) = result else {
-                        return Err(anyerr!("unexpected story result for sync_doc"));
-                    };
-                    break;
-                }
-                rounds += 1;
-                if rounds > MAX_SYNC_ROUNDS {
-                    return Err(anyerr!(
-                        "beelay sync did not converge within {MAX_SYNC_ROUNDS} rounds"
-                    ));
-                }
-                let frame = expect_tagged(&mut recv, TAG_BEELAY).await?;
-                let msg = Message::decode(&frame).std_context("decoding beelay message")?;
-                let env = connected
-                    .receive(msg)
-                    .std_context("routing beelay message")?;
-                msgs = self
+            // an adopting session wants only the preamble's events; it says bye
+            // straight away and leaves the content to the caller's sync_project.
+            if adopt.is_none() {
+                // pump the sync story to completion; the lock is taken per event.
+                // The round cap bounds a host that keeps answering without ever
+                // letting the story converge.
+                let (story, event) = Event::sync_doc(beelay_doc, connected.their_peer_id().clone());
+                let mut msgs = self
                     .shared
                     .state
                     .lock()
                     .await
                     .core
-                    .drive_scoped(Event::receive(env), Some(beelay_doc))?;
+                    .drive_scoped(event, Some(beelay_doc))?;
+                let mut rounds = 0usize;
+                loop {
+                    send_envelopes(&connected, msgs, &mut send).await?;
+                    if let Some(result) = self.shared.state.lock().await.core.stories.remove(&story)
+                    {
+                        let StoryResult::SyncDoc(_) = result else {
+                            return Err(anyerr!("unexpected story result for sync_doc"));
+                        };
+                        break;
+                    }
+                    rounds += 1;
+                    if rounds > MAX_SYNC_ROUNDS {
+                        return Err(anyerr!(
+                            "beelay sync did not converge within {MAX_SYNC_ROUNDS} rounds"
+                        ));
+                    }
+                    let frame = expect_tagged(&mut recv, TAG_BEELAY).await?;
+                    let msg = Message::decode(&frame).std_context("decoding beelay message")?;
+                    let env = connected
+                        .receive(msg)
+                        .std_context("routing beelay message")?;
+                    msgs = self
+                        .shared
+                        .state
+                        .lock()
+                        .await
+                        .core
+                        .drive_scoped(Event::receive(env), Some(beelay_doc))?;
+                }
             }
 
             // end-of-session: send bye, await the host's ack (sent after it
@@ -1552,6 +1592,27 @@ impl BeelayNode {
                 }
                 _ => Err(JoinError::Other(e)),
             };
+        }
+        // adopt only now: the preamble ingested the host's delegations, and a
+        // session that got this far means the host did not refuse us — so a
+        // refused peer never ends up with an adopted project. Must precede
+        // refresh, which decrypts and needs the doc mapping.
+        if let Some((keyhive_doc, group)) = adopt {
+            match self.shared.auth.doc_id(project_id) {
+                Some(doc) if doc != keyhive_doc => {
+                    return Err(anyerr!(
+                        "invite keyhive doc does not match known project {project_id}"
+                    )
+                    .into());
+                }
+                Some(_) => {}
+                None => {
+                    self.shared
+                        .auth
+                        .adopt_project(project_id, keyhive_doc, Some(group))
+                        .await?;
+                }
+            }
         }
         let outcome = self.shared.refresh(project_id).await?;
         conn.close(0u32.into(), b"done");
