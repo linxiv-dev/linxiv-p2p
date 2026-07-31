@@ -857,8 +857,8 @@ impl ProjectAuth {
 
     /// Everything `member` is authorized to see (visibility-filtered static
     /// events: delegations, revocations, key ops), as bytes to ship to them.
-    /// These bytes — plus the host's `EndpointId` and the project's
-    /// [`Self::doc_id`] — are what an invite carries.
+    /// Both sides swap these in every session preamble; that exchange, not
+    /// the invite string, is how a joiner learns the doc it will adopt.
     pub async fn export_events_for(&self, member: MemberId) -> Result<Vec<u8>> {
         let agent = self
             .keyhive
