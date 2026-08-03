@@ -1383,10 +1383,11 @@ async fn offline_accept_parks_invite() -> Result<()> {
 
     // Leaving must drop BOTH halves, or a re-accept takes the known-project
     // path and reuses this empty doc instead of adopting afresh.
-    assert!(bob
-        .forget_project("proj")
-        .await
-        .map_err(anyhow::Error::msg)?);
+    assert!(
+        bob.forget_project("proj")
+            .await
+            .map_err(anyhow::Error::msg)?
+    );
     assert!(
         bob.doc("proj").await.is_none(),
         "the registration must be gone"
@@ -1402,6 +1403,112 @@ async fn offline_accept_parks_invite() -> Result<()> {
         "forgetting an unknown project is a no-op, not an error"
     );
     bob.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// Members are granted and invited ONE AT A TIME in the app (add_member then
+/// invite, per member), so the first invite seals the content under an epoch
+/// the second member is not in — and the second invite has nothing pending
+/// left to flush. Without the re-seal in `invite`, carol here fetches every
+/// commit and decrypts none: `applied=0, no_key>0`, an empty mirror forever.
+///
+/// The other tests all add every member before the first invite, which hides
+/// this; keep the sequential order below.
+#[tokio::test(flavor = "multi_thread")]
+async fn member_invited_after_sealing_can_still_read() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (hoster_device, hoster_auth_id) = identities(dir.path(), "hoster");
+    let (bob_device, bob_auth_id) = identities(dir.path(), "bob");
+    let (carol_device, carol_auth_id) = identities(dir.path(), "carol");
+    let hoster_auth = ProjectAuth::new(&hoster_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_auth = ProjectAuth::new(&bob_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let carol_auth = ProjectAuth::new(&carol_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_member = hoster_auth
+        .receive_contact_card(&bob_auth.contact_card().await.map_err(anyhow::Error::msg)?)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let carol_member = hoster_auth
+        .receive_contact_card(
+            &carol_auth
+                .contact_card()
+                .await
+                .map_err(anyhow::Error::msg)?,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let hoster = BeelayNode::bind_local(&hoster_device, &hoster_auth_id, hoster_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let carol = BeelayNode::bind_local(&carol_device, &carol_auth_id, carol_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut doc = Automerge::new();
+    put(&mut doc, "title", "Sealed Before Carol");
+    hoster
+        .create_shared_project("proj", doc)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    // bob first, all the way through his invite: THIS is what seals the title.
+    hoster
+        .auth()
+        .add_member("proj", bob_member, Role::Edit)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_invite = hoster
+        .invite("proj", bob_member)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    bob.accept_invite(&bob_invite)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    bob.sync_project("proj").await.map_err(anyhow::Error::msg)?;
+
+    // carol arrives afterwards, with nothing left unflushed for her grant.
+    hoster
+        .auth()
+        .add_member("proj", carol_member, Role::Edit)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let carol_invite = hoster
+        .invite("proj", carol_member)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    carol
+        .accept_invite(&carol_invite)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let outcome = carol
+        .sync_project("proj")
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    assert!(
+        outcome.applied > 0,
+        "carol decrypted nothing: applied={} undecryptable={:?}",
+        outcome.applied,
+        outcome.undecryptable
+    );
+    let carol_doc = carol.doc("proj").await.unwrap();
+    assert_eq!(
+        get_str(&carol_doc, "title").as_deref(),
+        Some("Sealed Before Carol"),
+        "a member invited after sealing must still read the content"
+    );
+
+    for node in [hoster, bob, carol] {
+        node.shutdown().await.map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 
