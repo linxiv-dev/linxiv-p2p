@@ -854,6 +854,25 @@ impl Shared {
 
     /// Encrypts every not-yet-flushed local change into a beelay commit.
     async fn flush(&self, project_id: &str) -> Result<()> {
+        self.flush_inner(project_id, false).await
+    }
+
+    /// Re-encrypts the WHOLE history under the current epoch, on top of
+    /// whatever is already sealed.
+    ///
+    /// This is the keyhive #136 workaround (see the repro test): a member
+    /// granted after content was sealed holds no key for those commits, and
+    /// nothing re-keys them — the joiner fetches every commit and decrypts
+    /// none. Re-sealing after the grant gives them ciphertext they can open.
+    /// The stale commits stay in the doc; the reader counts them as no-key
+    /// once and applies the fresh ones.
+    async fn reseal(&self, project_id: &str) -> Result<()> {
+        self.flush_inner(project_id, true).await
+    }
+
+    /// `reseal` forgets which changes were already sealed, so the pass below
+    /// re-encrypts all of them instead of only the new ones.
+    async fn flush_inner(&self, project_id: &str, reseal: bool) -> Result<()> {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         let proj = state
@@ -864,6 +883,12 @@ impl Shared {
             return Err(anyerr!(
                 "project {project_id} failed its last refresh; sync it before flushing"
             ));
+        }
+        if reseal {
+            // An empty map makes unflushed_changes yield the whole history,
+            // still dependency-ordered, so commit_parents resolves each change
+            // against the entries this same pass just inserted.
+            proj.change_to_commit.clear();
         }
         let pending = unflushed_changes(&proj.doc, &proj.change_to_commit)?;
         if pending.is_empty() {
@@ -1390,13 +1415,15 @@ impl BeelayNode {
     }
 
     /// A pasteable invite for `member`, who must already hold a role from
-    /// [`ProjectAuth::add_member`]. Pending local changes are encrypted now,
-    /// after the grant, so the invitee can decrypt everything it will fetch.
+    /// [`ProjectAuth::add_member`]. The project's whole history is re-encrypted
+    /// here, after the grant, so the invitee can decrypt everything it will
+    /// fetch — content sealed before the grant is unreadable to them forever
+    /// otherwise (keyhive #136; see [`Shared::reseal`]).
     pub async fn invite(&self, project_id: &str, member: MemberId) -> Result<String> {
-        self.shared.flush(project_id).await?;
         // the grant used to be implicit in the event export; check it here so
         // inviting before add_member fails at mint time, not at the joiner's
-        // first dial.
+        // first dial. It also has to precede the re-seal, which is only
+        // correct once this member is in the epoch it seals under.
         if self
             .shared
             .auth
@@ -1408,6 +1435,7 @@ impl BeelayNode {
                 "member holds no role on {project_id}; add_member first"
             ));
         }
+        self.shared.reseal(project_id).await?;
         let keyhive_doc = self
             .shared
             .auth
@@ -1530,6 +1558,26 @@ impl BeelayNode {
                 Err(AnyError::from_std(e))
             }
         }
+    }
+
+    /// Re-encrypt a hosted project's whole history under the current epoch, so
+    /// every current member can read all of it. [`Self::invite`] does this
+    /// automatically; this is the repair for shares invited before that, whose
+    /// members are stuck fetching commits they have no key for.
+    pub async fn reseal_project(&self, project_id: &str) -> Result<()> {
+        {
+            let state = self.shared.state.lock().await;
+            let proj = state
+                .projects
+                .get(project_id)
+                .ok_or_else(|| anyerr!("unknown project {project_id}"))?;
+            if !matches!(proj.host, ProjectHost::Hosted) {
+                return Err(anyerr!(
+                    "project {project_id} is not hosted here; only its host can re-key it"
+                ));
+            }
+        }
+        self.shared.reseal(project_id).await
     }
 
     /// Drop every local trace of a joined project: its registry entry (doc,
