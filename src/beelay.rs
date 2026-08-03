@@ -1532,6 +1532,43 @@ impl BeelayNode {
         }
     }
 
+    /// Drop every local trace of a joined project: its registry entry (doc,
+    /// host address, commit maps) and any parked invite. Returns whether
+    /// anything was registered.
+    ///
+    /// This is the undo for [`Self::accept_invite`]. Leaving a share without it
+    /// keeps the registration, so a later re-accept takes the "known project"
+    /// path and REUSES the old document — including commits that never
+    /// decrypted. Forgetting first makes the rejoin a fresh adoption.
+    ///
+    /// Refuses a project this node hosts: unpublishing is the host-side undo.
+    ///
+    /// The encrypted commits stay in the beelay KV — this drops the plaintext
+    /// doc and the mapping that finds them, which is what a rejoin needs; it is
+    /// not a secure erase.
+    pub async fn forget_project(&self, project_id: &str) -> Result<bool> {
+        let existed = {
+            let mut state = self.shared.state.lock().await;
+            match state.projects.get(project_id) {
+                Some(p) if matches!(p.host, ProjectHost::Hosted) => {
+                    return Err(anyerr!(
+                        "this node hosts project {project_id}; unpublish it instead"
+                    ));
+                }
+                Some(_) => {
+                    state.projects.remove(project_id);
+                    self.shared.persist_registry(state).await?;
+                    true
+                }
+                None => false,
+            }
+        };
+        // A parked invite outlives the registry entry it was waiting on, and
+        // would re-adopt the project on the next sync sweep.
+        self.shared.clear_pending(project_id).await;
+        Ok(existed)
+    }
+
     /// Runs `f` on the local plaintext document. `None` if unknown.
     pub async fn with_doc<T>(
         &self,
