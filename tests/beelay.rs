@@ -1299,7 +1299,8 @@ fn parked(data_dir: &std::path::Path) -> Vec<(String, String)> {
 
 /// Accepting an invite the host cannot answer is not a failure: the project is
 /// registered empty, the invite is parked on disk, and the park survives a
-/// restart so the join can finish whenever the host turns up.
+/// restart so the join can finish whenever the host turns up. `forget_project`
+/// is the undo for that state — it must clear both halves.
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_accept_parks_invite() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1379,7 +1380,54 @@ async fn offline_accept_parks_invite() -> Result<()> {
         vec![("proj".to_string(), invite)],
         "the park must survive a restart"
     );
+
+    // Leaving must drop BOTH halves, or a re-accept takes the known-project
+    // path and reuses this empty doc instead of adopting afresh.
+    assert!(bob
+        .forget_project("proj")
+        .await
+        .map_err(anyhow::Error::msg)?);
+    assert!(
+        bob.doc("proj").await.is_none(),
+        "the registration must be gone"
+    );
+    assert!(
+        parked(&bob_data).is_empty(),
+        "the parked invite must go with it"
+    );
+    assert!(
+        !bob.forget_project("proj")
+            .await
+            .map_err(anyhow::Error::msg)?,
+        "forgetting an unknown project is a no-op, not an error"
+    );
     bob.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// A host must not be able to forget its own project out from under the share
+/// it is serving — unpublish is that side's undo.
+#[tokio::test(flavor = "multi_thread")]
+async fn forget_refuses_a_hosted_project() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (alice_device, alice_auth_id) = identities(dir.path(), "alice");
+    let alice_auth = ProjectAuth::new(&alice_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let alice = BeelayNode::bind_local(&alice_device, &alice_auth_id, alice_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    alice
+        .create_shared_project("proj", Automerge::new())
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    assert!(alice.forget_project("proj").await.is_err());
+    assert!(
+        alice.doc("proj").await.is_some(),
+        "a refused forget must leave the project registered"
+    );
+    alice.shutdown().await.map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
