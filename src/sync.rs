@@ -14,8 +14,8 @@ use automerge::{
     sync::{self, SyncDoc},
 };
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    endpoint::{Builder, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_tickets::{ParseError, Ticket, endpoint::EndpointTicket};
@@ -379,6 +379,39 @@ impl FromStr for ShareTicket {
     }
 }
 
+// --- custom relay ------------------------------------------------------------
+
+/// A self-hosted relay to dial instead of n0's public ones: url plus an
+/// optional bearer token for a relay configured with `access = shared_token`
+/// (see TODO.md's self-hosted relay access-control design). n0 discovery
+/// (DNS endpoint lookup) stays on — only the relay hop is swapped.
+#[derive(Debug, Clone)]
+pub struct CustomRelay {
+    url: RelayUrl,
+    auth_token: Option<String>,
+}
+
+impl CustomRelay {
+    /// Parses a relay URL (e.g. `https://relay.example.com`) with an optional
+    /// bearer auth token.
+    pub fn parse(url: &str, auth_token: Option<String>) -> Result<Self> {
+        let url = url.parse::<RelayUrl>().context("parsing relay url")?;
+        Ok(Self { url, auth_token })
+    }
+}
+
+impl presets::Preset for CustomRelay {
+    fn apply(self, builder: Builder) -> Builder {
+        let mut relay = RelayConfig::new(self.url, None);
+        if let Some(token) = self.auth_token {
+            relay = relay.with_auth_token(token);
+        }
+        presets::N0
+            .apply(builder)
+            .relay_mode(RelayMode::Custom(RelayMap::from(relay)))
+    }
+}
+
 // --- share node ------------------------------------------------------------
 
 pub(crate) type Projects = Arc<Mutex<HashMap<String, Automerge>>>;
@@ -403,6 +436,12 @@ impl ShareNode {
     /// [`EndpointAddr`] carried in tickets. Offline/LAN use and tests.
     pub async fn bind_local(identity: &DeviceIdentity) -> Result<Self> {
         Self::bind_with(identity, presets::Minimal).await
+    }
+
+    /// Binds with n0 discovery, but a self-hosted relay instead of n0's
+    /// public ones.
+    pub async fn bind_custom_relay(identity: &DeviceIdentity, relay: CustomRelay) -> Result<Self> {
+        Self::bind_with(identity, relay).await
     }
 
     async fn bind_with(identity: &DeviceIdentity, preset: impl presets::Preset) -> Result<Self> {

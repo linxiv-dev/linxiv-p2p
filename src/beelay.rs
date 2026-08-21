@@ -55,8 +55,8 @@ use tokio::sync::Mutex;
 use crate::{
     auth::{AuthIdentity, DecryptError, DeviceBinding, MemberId, ProjectAuth, Role},
     sync::{
-        DeviceIdentity, JoinError, MAX_SYNC_ROUNDS, RECV_TIMEOUT, REFUSED_CODE, ShareNode,
-        recv_frame, recv_frame_max, send_frame,
+        CustomRelay, DeviceIdentity, JoinError, MAX_SYNC_ROUNDS, RECV_TIMEOUT, REFUSED_CODE,
+        ShareNode, recv_frame, recv_frame_max, send_frame,
     },
 };
 
@@ -1213,6 +1213,18 @@ impl BeelayNode {
         Self::bind_with(identity, auth_identity, auth, data_dir, presets::Minimal).await
     }
 
+    /// Binds with n0 discovery, but a self-hosted relay instead of n0's
+    /// public ones.
+    pub async fn bind_custom_relay(
+        identity: &DeviceIdentity,
+        auth_identity: &AuthIdentity,
+        auth: ProjectAuth,
+        data_dir: Option<&Path>,
+        relay: CustomRelay,
+    ) -> Result<Self> {
+        Self::bind_with(identity, auth_identity, auth, data_dir, relay).await
+    }
+
     async fn bind_with(
         identity: &DeviceIdentity,
         auth_identity: &AuthIdentity,
@@ -2048,6 +2060,17 @@ pub async fn bind_stack_local(
     data_dir: Option<&Path>,
 ) -> Result<(ShareNode, BeelayNode)> {
     bind_stack_with(identity, auth_identity, auth, data_dir, presets::Minimal).await
+}
+
+/// [`bind_stack`], but with a self-hosted relay instead of n0's public ones.
+pub async fn bind_stack_custom_relay(
+    identity: &DeviceIdentity,
+    auth_identity: &AuthIdentity,
+    auth: ProjectAuth,
+    data_dir: Option<&Path>,
+    relay: CustomRelay,
+) -> Result<(ShareNode, BeelayNode)> {
+    bind_stack_with(identity, auth_identity, auth, data_dir, relay).await
 }
 
 async fn bind_stack_with(

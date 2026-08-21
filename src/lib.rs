@@ -4,7 +4,7 @@
 
 pub mod sync;
 
-pub use sync::{ALPN, AccessCheckFn, DeviceIdentity, ShareNode, ShareTicket};
+pub use sync::{ALPN, AccessCheckFn, CustomRelay, DeviceIdentity, ShareNode, ShareTicket};
 
 // vendor-edit: encrypted key store at rest (write-enforcement spec §8).
 #[cfg(feature = "encrypted-store")]
@@ -23,7 +23,8 @@ pub mod beelay;
 
 #[cfg(feature = "sync-beelay")]
 pub use beelay::{
-    BEELAY_ALPN, BeelayNode, ProjectInvite, SyncOutcome, bind_stack, bind_stack_local,
+    BEELAY_ALPN, BeelayNode, ProjectInvite, SyncOutcome, bind_stack, bind_stack_custom_relay,
+    bind_stack_local,
 };
 
 // vendor-edit: the crate's fallible surface returns `n0_error::AnyError`;
