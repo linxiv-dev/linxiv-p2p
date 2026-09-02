@@ -2,8 +2,13 @@
 //!
 //! App code uses only this root interface; `auth`/`sync` internals never leak.
 
+pub mod api;
 pub mod sync;
 
+pub use api::{
+    ALPN as API_ALPN, ApiClientError, ApiHandlerFn, ApiProtocol, ApiResponse, ByteLane, KnockLogFn,
+    MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
+};
 pub use sync::{ALPN, AccessCheckFn, CustomRelay, DeviceIdentity, ShareNode, ShareTicket};
 
 // vendor-edit: encrypted key store at rest (write-enforcement spec §8).
