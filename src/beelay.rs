@@ -2097,8 +2097,10 @@ async fn bind_stack_with(
     let binding = DeviceBinding::create(identity, auth_identity);
     let (shared, blobs) = BeelayNode::prepare(endpoint.id(), auth, binding, data_dir).await?;
     let (sync_proto, projects, access_check) = ShareNode::parts();
+    let api_slot = crate::api::ApiSlot::default();
     let router = Router::builder(endpoint)
         .accept(crate::sync::ALPN, sync_proto)
+        .accept(crate::api::ALPN, api_slot.clone())
         .accept(
             BEELAY_ALPN,
             BeelayProtocol {
@@ -2113,7 +2115,7 @@ async fn bind_stack_with(
             },
         )
         .spawn();
-    let share = ShareNode::from_parts(router.clone(), projects, access_check, discovery);
+    let share = ShareNode::from_parts(router.clone(), projects, access_check, discovery, api_slot);
     let beelay = BeelayNode::finish(router, shared, blobs).await?;
     Ok((share, beelay))
 }

@@ -171,6 +171,38 @@ async fn oversized_request_is_answered_413() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn api_slot_refuses_until_installed_then_delegates() -> Result<()> {
+    let slot = linxiv_p2p::ApiSlot::default();
+    let server = Endpoint::builder(presets::Minimal).bind().await?;
+    let router = Router::builder(server)
+        .accept(api::ALPN, slot.clone())
+        .spawn();
+    let addr = router.endpoint().addr();
+    let client = Endpoint::builder(presets::Minimal).bind().await?;
+    let req = json!({"method": "GET", "path": "/papers"});
+    // Empty slot: refused with a non-member's silence.
+    let conn = api::connect(&client, addr.clone()).await?;
+    let err = api::request(&conn, &req)
+        .await
+        .expect_err("an empty slot must not answer");
+    assert!(matches!(err, ApiClientError::Refused), "got: {err}");
+    // Installed (admit-all echo): the same dial round-trips.
+    slot.install(ApiProtocol::new(
+        Arc::new(|peer: &str| Some(peer.to_string())),
+        Arc::new(|_: &str| {}),
+        Arc::new(|_: &str, _| {}),
+        handler(),
+        1024,
+    ));
+    let conn = api::connect(&client, addr).await?;
+    let envelope = api::request(&conn, &req).await.expect("installed slot answers");
+    assert_eq!(envelope["status"], 200);
+    assert_eq!(envelope["body"]["echo"], req);
+    router.shutdown().await?;
+    Ok(())
+}
+
 #[test]
 fn node_address_roundtrip() {
     let id = iroh::SecretKey::generate().public();

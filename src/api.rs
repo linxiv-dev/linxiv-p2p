@@ -19,7 +19,7 @@ use std::{fmt, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
     endpoint::{Connection, ConnectionError, ReadToEndError, RecvStream, SendStream},
-    protocol::{AcceptError, ProtocolHandler},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
 };
 use iroh_tickets::{ParseError, Ticket};
 use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr};
@@ -201,6 +201,35 @@ impl<M: Clone + Send + 'static> ProtocolHandler for ApiProtocol<M> {
             tokio::spawn(async move { proto.handle_stream(member, &peer, send, recv).await });
         }
         Ok(())
+    }
+}
+
+/// Late-mount slot for [`ApiProtocol`]: iroh routers take protocols only at
+/// build time, but the bind paths run before the app can construct its
+/// handler (it closes over app state). So every bind mounts this empty slot
+/// at [`ALPN`] and the app installs the real handler afterwards. An empty
+/// slot refuses every connection with the same silence a non-member gets —
+/// desktop nodes simply never install anything.
+#[derive(Debug, Clone, Default)]
+pub struct ApiSlot(Arc<std::sync::Mutex<Option<Arc<dyn DynProtocolHandler>>>>);
+
+impl ApiSlot {
+    /// Installs (or replaces) the handler served at [`ALPN`].
+    pub fn install(&self, handler: impl Into<Box<dyn DynProtocolHandler>>) {
+        *self.0.lock().unwrap() = Some(Arc::from(handler.into()));
+    }
+}
+
+impl ProtocolHandler for ApiSlot {
+    async fn accept(&self, conn: Connection) -> std::result::Result<(), AcceptError> {
+        let inner = self.0.lock().unwrap().clone();
+        match inner {
+            Some(handler) => handler.accept(conn).await,
+            None => {
+                conn.close(REFUSED_CODE.into(), b"");
+                Ok(())
+            }
+        }
     }
 }
 

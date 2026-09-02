@@ -6,10 +6,15 @@ pub mod api;
 pub mod sync;
 
 pub use api::{
-    ALPN as API_ALPN, ApiClientError, ApiHandlerFn, ApiProtocol, ApiResponse, ByteLane, KnockLogFn,
-    MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
+    ALPN as API_ALPN, ApiClientError, ApiHandlerFn, ApiProtocol, ApiResponse, ApiSlot, ByteLane,
+    KnockLogFn, MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
 };
 pub use sync::{ALPN, AccessCheckFn, CustomRelay, DeviceIdentity, ShareNode, ShareTicket};
+
+// Remote Query Mode gives app crates protocol handlers to mount
+// ([`ShareNode::set_api_protocol`]) and a [`NodeAddress`] to mint — the iroh
+// types those touch, so callers need no direct iroh dependency.
+pub use iroh::{EndpointId, RelayUrl, protocol::DynProtocolHandler};
 
 // vendor-edit: encrypted key store at rest (write-enforcement spec §8).
 #[cfg(feature = "encrypted-store")]

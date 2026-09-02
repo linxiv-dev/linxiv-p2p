@@ -17,7 +17,7 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     TransportAddr,
     endpoint::{Builder, Connection, RecvStream, SendStream, presets},
-    protocol::{AcceptError, ProtocolHandler, Router},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
 };
 use iroh_tickets::{ParseError, Ticket, endpoint::EndpointTicket};
 use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr};
@@ -399,6 +399,11 @@ impl CustomRelay {
         let url = url.parse::<RelayUrl>().context("parsing relay url")?;
         Ok(Self { url, auth_token })
     }
+
+    /// The relay URL (for building a [`crate::NodeAddress`]; never the token).
+    pub fn url(&self) -> &RelayUrl {
+        &self.url
+    }
 }
 
 impl presets::Preset for CustomRelay {
@@ -429,6 +434,9 @@ pub struct ShareNode {
     // if tickets can drop direct addrs. Stored at bind — not re-derivable
     // from the endpoint later.
     discovery: bool,
+    // Remote Query Mode mount point, empty (refuse-all) until the headless
+    // bin installs its handler via [`Self::set_api_protocol`].
+    api_slot: crate::api::ApiSlot,
 }
 
 impl ShareNode {
@@ -460,8 +468,18 @@ impl ShareNode {
             .await
             .context("binding iroh endpoint")?;
         let (proto, projects, access_check) = Self::parts();
-        let router = Router::builder(endpoint).accept(ALPN, proto).spawn();
-        Ok(Self::from_parts(router, projects, access_check, discovery))
+        let api_slot = crate::api::ApiSlot::default();
+        let router = Router::builder(endpoint)
+            .accept(ALPN, proto)
+            .accept(crate::api::ALPN, api_slot.clone())
+            .spawn();
+        Ok(Self::from_parts(
+            router,
+            projects,
+            access_check,
+            discovery,
+            api_slot,
+        ))
     }
 
     // vendor-edit: handler/state halves so bind_stack can mount plain sync on
@@ -481,12 +499,14 @@ impl ShareNode {
         projects: Projects,
         access_check: AccessCheck,
         discovery: bool,
+        api_slot: crate::api::ApiSlot,
     ) -> Self {
         Self {
             router,
             projects,
             access_check,
             discovery,
+            api_slot,
         }
     }
 
@@ -501,6 +521,13 @@ impl ShareNode {
     /// [`crate::auth::ProjectAuth::access_callback`].
     pub fn set_access_check(&self, check: AccessCheckFn) {
         *self.access_check.0.lock().unwrap() = Some(check);
+    }
+
+    /// Installs the Remote Query Mode handler served at [`crate::api::ALPN`]
+    /// on this node's endpoint. Until installed, every api connection is
+    /// refused at the transport (the posture desktop nodes keep forever).
+    pub fn set_api_protocol(&self, handler: impl Into<Box<dyn DynProtocolHandler>>) {
+        self.api_slot.install(handler);
     }
 
     /// Registers (or replaces) a shared project document.
