@@ -15,6 +15,7 @@ use automerge::{
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    TransportAddr,
     endpoint::{Builder, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -424,27 +425,35 @@ pub struct ShareNode {
     // vendor-edit: access_check ungated — the linXiv share layer installs a
     // keyhive-free filesystem check.
     access_check: AccessCheck,
+    // Whether this node was bound with discovery (N0/custom relay); decides
+    // if tickets can drop direct addrs. Stored at bind — not re-derivable
+    // from the endpoint later.
+    discovery: bool,
 }
 
 impl ShareNode {
     /// Binds with n0 discovery + relays: dialable by bare [`EndpointId`].
     pub async fn bind(identity: &DeviceIdentity) -> Result<Self> {
-        Self::bind_with(identity, presets::N0).await
+        Self::bind_with(identity, presets::N0, true).await
     }
 
     /// Binds without discovery or relays: peers must dial the full
     /// [`EndpointAddr`] carried in tickets. Offline/LAN use and tests.
     pub async fn bind_local(identity: &DeviceIdentity) -> Result<Self> {
-        Self::bind_with(identity, presets::Minimal).await
+        Self::bind_with(identity, presets::Minimal, false).await
     }
 
     /// Binds with n0 discovery, but a self-hosted relay instead of n0's
     /// public ones.
     pub async fn bind_custom_relay(identity: &DeviceIdentity, relay: CustomRelay) -> Result<Self> {
-        Self::bind_with(identity, relay).await
+        Self::bind_with(identity, relay, true).await
     }
 
-    async fn bind_with(identity: &DeviceIdentity, preset: impl presets::Preset) -> Result<Self> {
+    async fn bind_with(
+        identity: &DeviceIdentity,
+        preset: impl presets::Preset,
+        discovery: bool,
+    ) -> Result<Self> {
         let endpoint = Endpoint::builder(preset)
             .secret_key(identity.secret.clone())
             .bind()
@@ -452,7 +461,7 @@ impl ShareNode {
             .context("binding iroh endpoint")?;
         let (proto, projects, access_check) = Self::parts();
         let router = Router::builder(endpoint).accept(ALPN, proto).spawn();
-        Ok(Self::from_parts(router, projects, access_check))
+        Ok(Self::from_parts(router, projects, access_check, discovery))
     }
 
     // vendor-edit: handler/state halves so bind_stack can mount plain sync on
@@ -471,11 +480,13 @@ impl ShareNode {
         router: Router,
         projects: Projects,
         access_check: AccessCheck,
+        discovery: bool,
     ) -> Self {
         Self {
             router,
             projects,
             access_check,
+            discovery,
         }
     }
 
@@ -512,12 +523,19 @@ impl ShareNode {
     }
 
     /// A pasteable invite for a registered project, carrying this node's
-    /// current address.
+    /// current address. On a discovery-bound node ([`Self::bind`] /
+    /// [`Self::bind_custom_relay`]) direct addrs are dropped — id + relay is
+    /// enough to dial, and shipping LAN/VPN addrs leaks them and roughly
+    /// doubles the ticket. [`Self::bind_local`] tickets keep the full addr.
     pub fn ticket(&self, project_id: &str) -> Result<ShareTicket> {
         if !self.projects.lock().unwrap().contains_key(project_id) {
             return Err(anyerr!("project {project_id} is not registered"));
         }
-        Ok(ShareTicket::new(self.router.endpoint().addr(), project_id))
+        let mut addr = self.router.endpoint().addr();
+        if self.discovery {
+            addr.addrs.retain(|a| matches!(a, TransportAddr::Relay(_)));
+        }
+        Ok(ShareTicket::new(addr, project_id))
     }
 
     /// Joins (or re-syncs) a shared project: dials the host in the ticket and

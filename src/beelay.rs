@@ -2048,7 +2048,7 @@ pub async fn bind_stack(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
 ) -> Result<(ShareNode, BeelayNode)> {
-    bind_stack_with(identity, auth_identity, auth, data_dir, presets::N0).await
+    bind_stack_with(identity, auth_identity, auth, data_dir, presets::N0, true).await
 }
 
 /// [`bind_stack`] without discovery or relays: peers must dial full addresses.
@@ -2059,7 +2059,15 @@ pub async fn bind_stack_local(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
 ) -> Result<(ShareNode, BeelayNode)> {
-    bind_stack_with(identity, auth_identity, auth, data_dir, presets::Minimal).await
+    bind_stack_with(
+        identity,
+        auth_identity,
+        auth,
+        data_dir,
+        presets::Minimal,
+        false,
+    )
+    .await
 }
 
 /// [`bind_stack`], but with a self-hosted relay instead of n0's public ones.
@@ -2070,7 +2078,7 @@ pub async fn bind_stack_custom_relay(
     data_dir: Option<&Path>,
     relay: CustomRelay,
 ) -> Result<(ShareNode, BeelayNode)> {
-    bind_stack_with(identity, auth_identity, auth, data_dir, relay).await
+    bind_stack_with(identity, auth_identity, auth, data_dir, relay, true).await
 }
 
 async fn bind_stack_with(
@@ -2079,6 +2087,7 @@ async fn bind_stack_with(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
     preset: impl presets::Preset,
+    discovery: bool,
 ) -> Result<(ShareNode, BeelayNode)> {
     let endpoint = Endpoint::builder(preset)
         .secret_key(identity.secret().clone())
@@ -2104,7 +2113,7 @@ async fn bind_stack_with(
             },
         )
         .spawn();
-    let share = ShareNode::from_parts(router.clone(), projects, access_check);
+    let share = ShareNode::from_parts(router.clone(), projects, access_check, discovery);
     let beelay = BeelayNode::finish(router, shared, blobs).await?;
     Ok((share, beelay))
 }

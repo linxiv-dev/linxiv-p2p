@@ -23,6 +23,35 @@ fn ticket_roundtrip() {
     assert_eq!(parsed.endpoint_id(), identity.endpoint_id());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_ticket_drops_direct_addrs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let identity = DeviceIdentity::load_or_generate(dir.path().join("k"))?;
+
+    // discovery-bound: id + relay only — no LAN/VPN addrs leaked.
+    let node = ShareNode::bind(&identity).await?;
+    node.register("proj", Automerge::new());
+    let ticket = node.ticket("proj")?;
+    assert_eq!(ticket.endpoint_addr().ip_addrs().count(), 0);
+    println!(
+        "discovery ticket ({} chars): {ticket}",
+        ticket.to_string().len()
+    );
+    node.shutdown().await?;
+
+    // bind_local peers must dial the full addr, so the ticket keeps it.
+    let node = ShareNode::bind_local(&identity).await?;
+    node.register("proj", Automerge::new());
+    let ticket = node.ticket("proj")?;
+    assert!(ticket.endpoint_addr().ip_addrs().count() > 0);
+    println!(
+        "local ticket ({} chars): {ticket}",
+        ticket.to_string().len()
+    );
+    node.shutdown().await?;
+    Ok(())
+}
+
 fn get_str(doc: &Automerge, key: &str) -> Option<String> {
     doc.get(ROOT, key)
         .unwrap()
