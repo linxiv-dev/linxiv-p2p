@@ -515,6 +515,12 @@ impl ShareNode {
         self.router.endpoint().id()
     }
 
+    /// The underlying iroh endpoint — for outbound Remote Query dials
+    /// ([`crate::api::connect`]); one endpoint serves and dials both ALPNs.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.router.endpoint()
+    }
+
     /// Installs (or replaces) the access check consulted before serving any
     /// project sync; a denied peer's stream is rejected. Belt-and-braces with
     /// app-level checks — build one from the capability layer with
