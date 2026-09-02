@@ -524,16 +524,22 @@ impl ShareNode {
 
     /// A pasteable invite for a registered project, carrying this node's
     /// current address. On a discovery-bound node ([`Self::bind`] /
-    /// [`Self::bind_custom_relay`]) direct addrs are dropped — id + relay is
-    /// enough to dial, and shipping LAN/VPN addrs leaks them and roughly
-    /// doubles the ticket. [`Self::bind_local`] tickets keep the full addr.
+    /// [`Self::bind_custom_relay`]) direct addrs are dropped once a relay is
+    /// known — id + relay is enough to dial, and shipping LAN/VPN addrs leaks
+    /// them and roughly doubles the ticket. Deliberate tradeoff: a short
+    /// (relay-only) ticket needs discovery or the relay reachable to dial, so
+    /// offline-LAN joins should use [`Self::bind_local`], whose tickets keep
+    /// the full addr. If no relay is known yet, the full addr is kept — a
+    /// ticket must always carry at least one transport addr.
+    // ponytail: no always-short/always-full knob; add one if the relay-only
+    // heuristic bites real users.
     pub fn ticket(&self, project_id: &str) -> Result<ShareTicket> {
         if !self.projects.lock().unwrap().contains_key(project_id) {
             return Err(anyerr!("project {project_id} is not registered"));
         }
         let mut addr = self.router.endpoint().addr();
         if self.discovery {
-            addr.addrs.retain(|a| matches!(a, TransportAddr::Relay(_)));
+            addr = relay_only(addr);
         }
         Ok(ShareTicket::new(addr, project_id))
     }
@@ -774,4 +780,43 @@ pub(crate) async fn recv_frame_max(recv: &mut RecvStream, max_len: u64) -> Resul
     })
     .await
     .map_err(|_| anyerr!("timed out waiting for peer frame"))?
+}
+
+/// Keeps only the relay entries of `addr`; if that would leave zero transport
+/// addrs (no relay known yet), keeps the full addr so the ticket stays
+/// dialable.
+fn relay_only(mut addr: EndpointAddr) -> EndpointAddr {
+    if addr.addrs.iter().any(TransportAddr::is_relay) {
+        addr.addrs.retain(TransportAddr::is_relay);
+    }
+    addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_only_keeps_exactly_the_relay_entries() {
+        let id = SecretKey::generate().public();
+        let relay: RelayUrl = "https://relay.example".parse().unwrap();
+        let addr = EndpointAddr::new(id)
+            .with_relay_url(relay.clone())
+            .with_ip_addr("192.168.1.2:4433".parse().unwrap())
+            .with_ip_addr("10.0.0.7:4433".parse().unwrap());
+        let short = relay_only(addr);
+        assert_eq!(
+            short.addrs.into_iter().collect::<Vec<_>>(),
+            vec![TransportAddr::Relay(relay)]
+        );
+    }
+
+    #[test]
+    fn relay_only_keeps_full_addr_when_no_relay_known() {
+        let id = SecretKey::generate().public();
+        let addr = EndpointAddr::new(id).with_ip_addr("192.168.1.2:4433".parse().unwrap());
+        let out = relay_only(addr.clone());
+        assert!(!out.is_empty(), "a ticket must carry >0 transport addrs");
+        assert_eq!(out, addr);
+    }
 }
