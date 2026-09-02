@@ -7,7 +7,7 @@ pub mod sync;
 
 pub use api::{
     ALPN as API_ALPN, ApiClientError, ApiHandlerFn, ApiProtocol, ApiResponse, ApiSlot, ByteLane,
-    KnockLogFn, MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
+    KnockLogFn, MaxRequestFn, MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
 };
 pub use sync::{ALPN, AccessCheckFn, CustomRelay, DeviceIdentity, ShareNode, ShareTicket};
 

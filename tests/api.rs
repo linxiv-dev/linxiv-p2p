@@ -17,8 +17,9 @@ fn pdf_bytes() -> Vec<u8> {
     (0..PDF_SIZE).map(|i| (i % 251) as u8).collect()
 }
 
-/// Echo handler: `path == "/pdf"` answers on the byte lane, anything else
-/// echoes the request back inside a 200 envelope.
+/// Echo handler: `path == "/pdf"` answers on the byte lane (`"/huge"`: a
+/// lane declaring an absurd size), anything else echoes the request back
+/// inside a 200 envelope.
 fn handler() -> api::ApiHandlerFn<String> {
     Arc::new(|member: String, body: Vec<u8>| {
         Box::pin(async move {
@@ -28,6 +29,14 @@ fn handler() -> api::ApiHandlerFn<String> {
                     header: api::byte_header(PDF_SIZE, PDF_RATE),
                     source: Box::new(std::io::Cursor::new(pdf_bytes())),
                     size: PDF_SIZE,
+                    rate: PDF_RATE,
+                }
+            } else if req.get("path").and_then(Value::as_str) == Some("/huge") {
+                // A malicious node's header: declares 1 GiB, ships nothing.
+                ApiResponse::Bytes {
+                    header: api::byte_header(1 << 30, PDF_RATE),
+                    source: Box::new(std::io::Cursor::new(Vec::new())),
+                    size: 1 << 30,
                     rate: PDF_RATE,
                 }
             } else {
@@ -65,7 +74,7 @@ async fn bind_pair(
         Arc::new(move |peer: &str| knocks.lock().unwrap().push(peer.to_string())),
         Arc::new(move |_peer: &str, outcome| transfers.lock().unwrap().push(outcome)),
         handler(),
-        max_request,
+        Arc::new(move |_member: &String| max_request),
     );
     let server = Endpoint::builder(presets::Minimal).bind().await?;
     let router = Router::builder(server).accept(api::ALPN, proto).spawn();
@@ -157,6 +166,24 @@ async fn byte_lane_delivers_exact_paced_payload() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn byte_lane_rejects_an_over_cap_declared_size() -> Result<()> {
+    let client_ep = Endpoint::builder(presets::Minimal).bind().await?;
+    let (router, addr, _unused, _logs) = bind_pair(Some(client_ep.id()), 1024 * 1024).await?;
+    let conn = api::connect(&client_ep, addr).await?;
+    let (header, lane) = api::request_bytes(&conn, &json!({"method": "GET", "path": "/huge"}))
+        .await
+        .expect("header still parses");
+    assert_eq!(header["size"], 1u64 << 30);
+    let err = lane
+        .read_to_vec()
+        .await
+        .expect_err("a remote-declared 1 GiB must not be trusted");
+    assert!(err.to_string().contains("cap"), "got: {err}");
+    router.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oversized_request_is_answered_413() -> Result<()> {
     let client_ep = Endpoint::builder(presets::Minimal).bind().await?;
     let (router, addr, _unused, _logs) = bind_pair(Some(client_ep.id()), 1024).await?;
@@ -193,7 +220,7 @@ async fn api_slot_refuses_until_installed_then_delegates() -> Result<()> {
         Arc::new(|_: &str| {}),
         Arc::new(|_: &str, _| {}),
         handler(),
-        1024,
+        Arc::new(|_: &String| 1024),
     ));
     let conn = api::connect(&client, addr).await?;
     let envelope = api::request(&conn, &req).await.expect("installed slot answers");

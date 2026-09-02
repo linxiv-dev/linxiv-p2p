@@ -39,6 +39,10 @@ const REFUSED_CODE: u32 = 1;
 /// Cap on a JSON response (or byte-lane header line) the client buffers.
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
+/// Cap on a byte-lane payload the client will buffer: the declared `size`
+/// is remote-controlled, so it must never drive an allocation past this.
+const MAX_LANE_PAYLOAD: u64 = 256 * 1024 * 1024;
+
 // --- server ------------------------------------------------------------------
 
 /// Membership gate: `remote endpoint id (string form)` -> the caller's
@@ -48,6 +52,10 @@ pub type MemberCheckFn<M> = Arc<dyn Fn(&str) -> Option<M> + Send + Sync>;
 
 /// Fired with the knocking endpoint id when a connection is refused.
 pub type KnockLogFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Per-connection request-body cap, derived from the admitted member: role
+/// `read` gets ~1 MiB, `read-write` enough for `file_b64` PDF imports.
+pub type MaxRequestFn<M> = Arc<dyn Fn(&M) -> usize + Send + Sync>;
 
 /// Fired with `(peer endpoint id, outcome)` when a byte-lane transfer ends.
 /// There is no application-level receipt: this is the sender's own view.
@@ -102,26 +110,25 @@ pub struct ApiProtocol<M> {
     knock_log: KnockLogFn,
     transfer_log: TransferLogFn,
     handler: ApiHandlerFn<M>,
-    max_request: usize,
+    max_request: MaxRequestFn<M>,
 }
 
 impl<M> fmt::Debug for ApiProtocol<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ApiProtocol")
-            .field("max_request", &self.max_request)
-            .finish_non_exhaustive()
+        f.debug_struct("ApiProtocol").finish_non_exhaustive()
     }
 }
 
 impl<M: Clone + Send + 'static> ApiProtocol<M> {
-    /// `max_request` caps the request body read (design: ~1 MiB); an
-    /// oversized request is answered with a `413` envelope.
+    /// `max_request` derives the request-body cap from the admitted member
+    /// (role-aware by design: ~1 MiB for `read`, upload-sized for
+    /// `read-write`); an oversized request is answered with a `413` envelope.
     pub fn new(
         member_check: MemberCheckFn<M>,
         knock_log: KnockLogFn,
         transfer_log: TransferLogFn,
         handler: ApiHandlerFn<M>,
-        max_request: usize,
+        max_request: MaxRequestFn<M>,
     ) -> Self {
         Self {
             member_check,
@@ -139,13 +146,14 @@ impl<M: Clone + Send + 'static> ApiProtocol<M> {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
+        let max_request = (self.max_request)(&member);
         let body =
-            match tokio::time::timeout(RECV_TIMEOUT, recv.read_to_end(self.max_request)).await {
+            match tokio::time::timeout(RECV_TIMEOUT, recv.read_to_end(max_request)).await {
                 Ok(Ok(body)) => body,
                 Ok(Err(ReadToEndError::TooLong)) => {
                     let env = json!({
                         "status": 413,
-                        "detail": format!("request body exceeds {} bytes", self.max_request),
+                        "detail": format!("request body exceeds {max_request} bytes"),
                     });
                     let _ = send.write_all(env.to_string().as_bytes()).await;
                     let _ = send.finish();
@@ -365,15 +373,33 @@ impl ByteLane {
     }
 
     /// Reads the whole payload; errors if the stream carries fewer or more
-    /// bytes than declared.
+    /// bytes than declared, or declares more than [`MAX_LANE_PAYLOAD`].
     // ponytail: buffers in memory (PDF-sized payloads); add a
     // stream-to-file helper when callers outgrow Vec.
     pub async fn read_to_vec(mut self) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; self.size as usize];
-        self.recv
-            .read_exact(&mut buf)
-            .await
-            .std_context("reading byte-lane payload")?;
+        if self.size > MAX_LANE_PAYLOAD {
+            return Err(anyerr!(
+                "byte-lane payload declares {} bytes, cap is {MAX_LANE_PAYLOAD}",
+                self.size
+            ));
+        }
+        let size = usize::try_from(self.size).std_context("byte-lane size")?;
+        // Grow with the bytes actually received — the declared size is the
+        // peer's claim, never the initial allocation.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        while buf.len() < size {
+            let want = chunk.len().min(size - buf.len());
+            match self
+                .recv
+                .read(&mut chunk[..want])
+                .await
+                .std_context("reading byte-lane payload")?
+            {
+                None => return Err(anyerr!("byte lane ended before its declared size")),
+                Some(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
         match self
             .recv
             .read(&mut [0u8; 1])
