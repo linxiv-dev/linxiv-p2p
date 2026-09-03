@@ -18,7 +18,7 @@ use std::{fmt, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl,
-    endpoint::{Connection, ConnectionError, ReadToEndError, RecvStream, SendStream},
+    endpoint::{Connection, ConnectionError, ReadToEndError, RecvStream, SendStream, WriteError},
     protocol::{AcceptError, DynProtocolHandler, ProtocolHandler},
 };
 use iroh_tickets::{ParseError, Ticket};
@@ -417,16 +417,24 @@ async fn send_request(
     conn: &Connection,
     request: &Value,
 ) -> std::result::Result<RecvStream, ApiClientError> {
-    let res = async {
-        let (mut send, recv) = conn.open_bi().await.std_context("opening request stream")?;
-        send.write_all(request.to_string().as_bytes())
-            .await
-            .std_context("writing request")?;
-        send.finish().std_context("finishing request")?;
-        Ok::<_, AnyError>(recv)
+    let (mut send, recv) = conn
+        .open_bi()
+        .await
+        .std_context("opening request stream")
+        .map_err(|e| refusal_or(conn, e))?;
+    // A peer that STOPs our send side mid-write is not a failure: the server
+    // stops reading once its request cap trips and answers a 413 envelope —
+    // that answer is on `recv`, so hand it to the caller instead of erroring.
+    match send.write_all(request.to_string().as_bytes()).await {
+        Ok(()) => {
+            // Same race at finish time: a late STOP fails the finish while
+            // the response is already in flight.
+            let _ = send.finish();
+        }
+        Err(WriteError::Stopped(_)) => {}
+        Err(e) => return Err(refusal_or(conn, anyerr!("writing request: {e}"))),
     }
-    .await;
-    res.map_err(|e| refusal_or(conn, e))
+    Ok(recv)
 }
 
 /// A failure on a connection the peer application-closed is a refusal;
