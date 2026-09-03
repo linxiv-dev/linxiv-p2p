@@ -14,9 +14,10 @@ use automerge::{
     sync::{self, SyncDoc},
 };
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
-    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    TransportAddr,
+    endpoint::{Builder, Connection, RecvStream, SendStream, presets},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
 };
 use iroh_tickets::{ParseError, Ticket, endpoint::EndpointTicket};
 use n0_error::{AnyError, Result, StackResultExt, StdResultExt, anyerr};
@@ -379,6 +380,44 @@ impl FromStr for ShareTicket {
     }
 }
 
+// --- custom relay ------------------------------------------------------------
+
+/// A self-hosted relay to dial instead of n0's public ones: url plus an
+/// optional bearer token for a relay configured with `access = shared_token`
+/// (see TODO.md's self-hosted relay access-control design). n0 discovery
+/// (DNS endpoint lookup) stays on — only the relay hop is swapped.
+#[derive(Debug, Clone)]
+pub struct CustomRelay {
+    url: RelayUrl,
+    auth_token: Option<String>,
+}
+
+impl CustomRelay {
+    /// Parses a relay URL (e.g. `https://relay.example.com`) with an optional
+    /// bearer auth token.
+    pub fn parse(url: &str, auth_token: Option<String>) -> Result<Self> {
+        let url = url.parse::<RelayUrl>().context("parsing relay url")?;
+        Ok(Self { url, auth_token })
+    }
+
+    /// The relay URL (for building a [`crate::NodeAddress`]; never the token).
+    pub fn url(&self) -> &RelayUrl {
+        &self.url
+    }
+}
+
+impl presets::Preset for CustomRelay {
+    fn apply(self, builder: Builder) -> Builder {
+        let mut relay = RelayConfig::new(self.url, None);
+        if let Some(token) = self.auth_token {
+            relay = relay.with_auth_token(token);
+        }
+        presets::N0
+            .apply(builder)
+            .relay_mode(RelayMode::Custom(RelayMap::from(relay)))
+    }
+}
+
 // --- share node ------------------------------------------------------------
 
 pub(crate) type Projects = Arc<Mutex<HashMap<String, Automerge>>>;
@@ -391,29 +430,56 @@ pub struct ShareNode {
     // vendor-edit: access_check ungated — the linXiv share layer installs a
     // keyhive-free filesystem check.
     access_check: AccessCheck,
+    // Whether this node was bound with discovery (N0/custom relay); decides
+    // if tickets can drop direct addrs. Stored at bind — not re-derivable
+    // from the endpoint later.
+    discovery: bool,
+    // Remote Query Mode mount point, empty (refuse-all) until the headless
+    // bin installs its handler via [`Self::set_api_protocol`].
+    api_slot: crate::api::ApiSlot,
 }
 
 impl ShareNode {
     /// Binds with n0 discovery + relays: dialable by bare [`EndpointId`].
     pub async fn bind(identity: &DeviceIdentity) -> Result<Self> {
-        Self::bind_with(identity, presets::N0).await
+        Self::bind_with(identity, presets::N0, true).await
     }
 
     /// Binds without discovery or relays: peers must dial the full
     /// [`EndpointAddr`] carried in tickets. Offline/LAN use and tests.
     pub async fn bind_local(identity: &DeviceIdentity) -> Result<Self> {
-        Self::bind_with(identity, presets::Minimal).await
+        Self::bind_with(identity, presets::Minimal, false).await
     }
 
-    async fn bind_with(identity: &DeviceIdentity, preset: impl presets::Preset) -> Result<Self> {
+    /// Binds with n0 discovery, but a self-hosted relay instead of n0's
+    /// public ones.
+    pub async fn bind_custom_relay(identity: &DeviceIdentity, relay: CustomRelay) -> Result<Self> {
+        Self::bind_with(identity, relay, true).await
+    }
+
+    async fn bind_with(
+        identity: &DeviceIdentity,
+        preset: impl presets::Preset,
+        discovery: bool,
+    ) -> Result<Self> {
         let endpoint = Endpoint::builder(preset)
             .secret_key(identity.secret.clone())
             .bind()
             .await
             .context("binding iroh endpoint")?;
         let (proto, projects, access_check) = Self::parts();
-        let router = Router::builder(endpoint).accept(ALPN, proto).spawn();
-        Ok(Self::from_parts(router, projects, access_check))
+        let api_slot = crate::api::ApiSlot::default();
+        let router = Router::builder(endpoint)
+            .accept(ALPN, proto)
+            .accept(crate::api::ALPN, api_slot.clone())
+            .spawn();
+        Ok(Self::from_parts(
+            router,
+            projects,
+            access_check,
+            discovery,
+            api_slot,
+        ))
     }
 
     // vendor-edit: handler/state halves so bind_stack can mount plain sync on
@@ -432,11 +498,15 @@ impl ShareNode {
         router: Router,
         projects: Projects,
         access_check: AccessCheck,
+        discovery: bool,
+        api_slot: crate::api::ApiSlot,
     ) -> Self {
         Self {
             router,
             projects,
             access_check,
+            discovery,
+            api_slot,
         }
     }
 
@@ -445,12 +515,25 @@ impl ShareNode {
         self.router.endpoint().id()
     }
 
+    /// The underlying iroh endpoint — for outbound Remote Query dials
+    /// ([`crate::api::connect`]); one endpoint serves and dials both ALPNs.
+    pub fn endpoint(&self) -> &Endpoint {
+        self.router.endpoint()
+    }
+
     /// Installs (or replaces) the access check consulted before serving any
     /// project sync; a denied peer's stream is rejected. Belt-and-braces with
     /// app-level checks — build one from the capability layer with
     /// [`crate::auth::ProjectAuth::access_callback`].
     pub fn set_access_check(&self, check: AccessCheckFn) {
         *self.access_check.0.lock().unwrap() = Some(check);
+    }
+
+    /// Installs the Remote Query Mode handler served at [`crate::api::ALPN`]
+    /// on this node's endpoint. Until installed, every api connection is
+    /// refused at the transport (the posture desktop nodes keep forever).
+    pub fn set_api_protocol(&self, handler: impl Into<Box<dyn DynProtocolHandler>>) {
+        self.api_slot.install(handler);
     }
 
     /// Registers (or replaces) a shared project document.
@@ -473,12 +556,25 @@ impl ShareNode {
     }
 
     /// A pasteable invite for a registered project, carrying this node's
-    /// current address.
+    /// current address. On a discovery-bound node ([`Self::bind`] /
+    /// [`Self::bind_custom_relay`]) direct addrs are dropped once a relay is
+    /// known — id + relay is enough to dial, and shipping LAN/VPN addrs leaks
+    /// them and roughly doubles the ticket. Deliberate tradeoff: a short
+    /// (relay-only) ticket needs discovery or the relay reachable to dial, so
+    /// offline-LAN joins should use [`Self::bind_local`], whose tickets keep
+    /// the full addr. If no relay is known yet, the full addr is kept — a
+    /// ticket must always carry at least one transport addr.
+    // ponytail: no always-short/always-full knob; add one if the relay-only
+    // heuristic bites real users.
     pub fn ticket(&self, project_id: &str) -> Result<ShareTicket> {
         if !self.projects.lock().unwrap().contains_key(project_id) {
             return Err(anyerr!("project {project_id} is not registered"));
         }
-        Ok(ShareTicket::new(self.router.endpoint().addr(), project_id))
+        let mut addr = self.router.endpoint().addr();
+        if self.discovery {
+            addr = relay_only(addr);
+        }
+        Ok(ShareTicket::new(addr, project_id))
     }
 
     /// Joins (or re-syncs) a shared project: dials the host in the ticket and
@@ -717,4 +813,43 @@ pub(crate) async fn recv_frame_max(recv: &mut RecvStream, max_len: u64) -> Resul
     })
     .await
     .map_err(|_| anyerr!("timed out waiting for peer frame"))?
+}
+
+/// Keeps only the relay entries of `addr`; if that would leave zero transport
+/// addrs (no relay known yet), keeps the full addr so the ticket stays
+/// dialable.
+fn relay_only(mut addr: EndpointAddr) -> EndpointAddr {
+    if addr.addrs.iter().any(TransportAddr::is_relay) {
+        addr.addrs.retain(TransportAddr::is_relay);
+    }
+    addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_only_keeps_exactly_the_relay_entries() {
+        let id = SecretKey::generate().public();
+        let relay: RelayUrl = "https://relay.example".parse().unwrap();
+        let addr = EndpointAddr::new(id)
+            .with_relay_url(relay.clone())
+            .with_ip_addr("192.168.1.2:4433".parse().unwrap())
+            .with_ip_addr("10.0.0.7:4433".parse().unwrap());
+        let short = relay_only(addr);
+        assert_eq!(
+            short.addrs.into_iter().collect::<Vec<_>>(),
+            vec![TransportAddr::Relay(relay)]
+        );
+    }
+
+    #[test]
+    fn relay_only_keeps_full_addr_when_no_relay_known() {
+        let id = SecretKey::generate().public();
+        let addr = EndpointAddr::new(id).with_ip_addr("192.168.1.2:4433".parse().unwrap());
+        let out = relay_only(addr.clone());
+        assert!(!out.is_empty(), "a ticket must carry >0 transport addrs");
+        assert_eq!(out, addr);
+    }
 }

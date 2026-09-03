@@ -55,8 +55,8 @@ use tokio::sync::Mutex;
 use crate::{
     auth::{AuthIdentity, DecryptError, DeviceBinding, MemberId, ProjectAuth, Role},
     sync::{
-        DeviceIdentity, JoinError, MAX_SYNC_ROUNDS, RECV_TIMEOUT, REFUSED_CODE, ShareNode,
-        recv_frame, recv_frame_max, send_frame,
+        CustomRelay, DeviceIdentity, JoinError, MAX_SYNC_ROUNDS, RECV_TIMEOUT, REFUSED_CODE,
+        ShareNode, recv_frame, recv_frame_max, send_frame,
     },
 };
 
@@ -1213,6 +1213,18 @@ impl BeelayNode {
         Self::bind_with(identity, auth_identity, auth, data_dir, presets::Minimal).await
     }
 
+    /// Binds with n0 discovery, but a self-hosted relay instead of n0's
+    /// public ones.
+    pub async fn bind_custom_relay(
+        identity: &DeviceIdentity,
+        auth_identity: &AuthIdentity,
+        auth: ProjectAuth,
+        data_dir: Option<&Path>,
+        relay: CustomRelay,
+    ) -> Result<Self> {
+        Self::bind_with(identity, auth_identity, auth, data_dir, relay).await
+    }
+
     async fn bind_with(
         identity: &DeviceIdentity,
         auth_identity: &AuthIdentity,
@@ -2036,7 +2048,7 @@ pub async fn bind_stack(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
 ) -> Result<(ShareNode, BeelayNode)> {
-    bind_stack_with(identity, auth_identity, auth, data_dir, presets::N0).await
+    bind_stack_with(identity, auth_identity, auth, data_dir, presets::N0, true).await
 }
 
 /// [`bind_stack`] without discovery or relays: peers must dial full addresses.
@@ -2047,7 +2059,26 @@ pub async fn bind_stack_local(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
 ) -> Result<(ShareNode, BeelayNode)> {
-    bind_stack_with(identity, auth_identity, auth, data_dir, presets::Minimal).await
+    bind_stack_with(
+        identity,
+        auth_identity,
+        auth,
+        data_dir,
+        presets::Minimal,
+        false,
+    )
+    .await
+}
+
+/// [`bind_stack`], but with a self-hosted relay instead of n0's public ones.
+pub async fn bind_stack_custom_relay(
+    identity: &DeviceIdentity,
+    auth_identity: &AuthIdentity,
+    auth: ProjectAuth,
+    data_dir: Option<&Path>,
+    relay: CustomRelay,
+) -> Result<(ShareNode, BeelayNode)> {
+    bind_stack_with(identity, auth_identity, auth, data_dir, relay, true).await
 }
 
 async fn bind_stack_with(
@@ -2056,6 +2087,7 @@ async fn bind_stack_with(
     auth: ProjectAuth,
     data_dir: Option<&Path>,
     preset: impl presets::Preset,
+    discovery: bool,
 ) -> Result<(ShareNode, BeelayNode)> {
     let endpoint = Endpoint::builder(preset)
         .secret_key(identity.secret().clone())
@@ -2065,8 +2097,10 @@ async fn bind_stack_with(
     let binding = DeviceBinding::create(identity, auth_identity);
     let (shared, blobs) = BeelayNode::prepare(endpoint.id(), auth, binding, data_dir).await?;
     let (sync_proto, projects, access_check) = ShareNode::parts();
+    let api_slot = crate::api::ApiSlot::default();
     let router = Router::builder(endpoint)
         .accept(crate::sync::ALPN, sync_proto)
+        .accept(crate::api::ALPN, api_slot.clone())
         .accept(
             BEELAY_ALPN,
             BeelayProtocol {
@@ -2081,7 +2115,7 @@ async fn bind_stack_with(
             },
         )
         .spawn();
-    let share = ShareNode::from_parts(router.clone(), projects, access_check);
+    let share = ShareNode::from_parts(router.clone(), projects, access_check, discovery, api_slot);
     let beelay = BeelayNode::finish(router, shared, blobs).await?;
     Ok((share, beelay))
 }

@@ -2,9 +2,23 @@
 //!
 //! App code uses only this root interface; `auth`/`sync` internals never leak.
 
+pub mod api;
 pub mod sync;
 
-pub use sync::{ALPN, AccessCheckFn, DeviceIdentity, ShareNode, ShareTicket};
+pub use api::{
+    ALPN as API_ALPN, ApiClientError, ApiHandlerFn, ApiProtocol, ApiResponse, ApiSlot, ByteLane,
+    KnockLogFn, MaxRequestFn, MemberCheckFn, NodeAddress, TransferLogFn, TransferOutcome,
+};
+pub use sync::{ALPN, AccessCheckFn, CustomRelay, DeviceIdentity, ShareNode, ShareTicket};
+
+// Remote Query Mode gives app crates protocol handlers to mount
+// ([`ShareNode::set_api_protocol`]), a [`NodeAddress`] to mint, and a client
+// ([`api::connect`]/[`api::request`]) to dial with — the iroh types those
+// touch, so callers need no direct iroh dependency.
+pub use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, endpoint::Connection,
+    protocol::DynProtocolHandler,
+};
 
 // vendor-edit: encrypted key store at rest (write-enforcement spec §8).
 #[cfg(feature = "encrypted-store")]
@@ -23,7 +37,8 @@ pub mod beelay;
 
 #[cfg(feature = "sync-beelay")]
 pub use beelay::{
-    BEELAY_ALPN, BeelayNode, ProjectInvite, SyncOutcome, bind_stack, bind_stack_local,
+    BEELAY_ALPN, BeelayNode, ProjectInvite, SyncOutcome, bind_stack, bind_stack_custom_relay,
+    bind_stack_local,
 };
 
 // vendor-edit: the crate's fallible surface returns `n0_error::AnyError`;
