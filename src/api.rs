@@ -147,21 +147,20 @@ impl<M: Clone + Send + 'static> ApiProtocol<M> {
         mut recv: RecvStream,
     ) {
         let max_request = (self.max_request)(&member);
-        let body =
-            match tokio::time::timeout(RECV_TIMEOUT, recv.read_to_end(max_request)).await {
-                Ok(Ok(body)) => body,
-                Ok(Err(ReadToEndError::TooLong)) => {
-                    let env = json!({
-                        "status": 413,
-                        "detail": format!("request body exceeds {max_request} bytes"),
-                    });
-                    let _ = send.write_all(env.to_string().as_bytes()).await;
-                    let _ = send.finish();
-                    return;
-                }
-                // reset or silent peer: nothing sensible to answer.
-                _ => return,
-            };
+        let body = match tokio::time::timeout(RECV_TIMEOUT, recv.read_to_end(max_request)).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(ReadToEndError::TooLong)) => {
+                let env = json!({
+                    "status": 413,
+                    "detail": format!("request body exceeds {max_request} bytes"),
+                });
+                let _ = send.write_all(env.to_string().as_bytes()).await;
+                let _ = send.finish();
+                return;
+            }
+            // reset or silent peer: nothing sensible to answer.
+            _ => return,
+        };
         match (self.handler)(member, body).await {
             ApiResponse::Json(env) => {
                 let _ = send.write_all(env.to_string().as_bytes()).await;

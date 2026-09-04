@@ -223,7 +223,9 @@ async fn api_slot_refuses_until_installed_then_delegates() -> Result<()> {
         Arc::new(|_: &String| 1024),
     ));
     let conn = api::connect(&client, addr).await?;
-    let envelope = api::request(&conn, &req).await.expect("installed slot answers");
+    let envelope = api::request(&conn, &req)
+        .await
+        .expect("installed slot answers");
     assert_eq!(envelope["status"], 200);
     assert_eq!(envelope["body"]["echo"], req);
     router.shutdown().await?;
