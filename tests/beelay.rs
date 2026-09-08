@@ -26,9 +26,8 @@ fn put(doc: &mut Automerge, key: &str, value: &str) {
         .unwrap();
 }
 
-/// THE PLAN GATE: two offline nodes; alice shares an encrypted project with
-/// bob, both edit and converge, then alice revokes bob and rotates — bob
-/// keeps his epoch's content but is refused further sync.
+/// THE PLAN GATE: alice shares an encrypted project with bob, both edit and converge,
+/// then alice revokes and rotates — bob keeps his epoch's content but is refused further sync.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_toy_project() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -168,11 +167,9 @@ async fn e2e_toy_project() -> Result<()> {
     Ok(())
 }
 
-/// Upstream keyhive #136 at our stack level
-/// (https://github.com/inkandswitch/keyhive/issues/136): content encrypted
-/// BEFORE a member is granted stays undecryptable to them — the initial-
-/// commit sync failure shape. The carried workaround: re-encrypt after the
-/// grant (BeelayNode bakes this in by flushing lazily at invite/sync time).
+/// Upstream keyhive #136 (https://github.com/inkandswitch/keyhive/issues/136):
+/// content encrypted BEFORE a member is granted stays undecryptable to them. The
+/// carried workaround: re-encrypt after the grant (BeelayNode flushes lazily).
 #[tokio::test(flavor = "multi_thread")]
 async fn keyhive_136_repro_and_workaround() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -244,9 +241,8 @@ async fn keyhive_136_repro_and_workaround() -> Result<()> {
     Ok(())
 }
 
-/// Two loopback nodes with a shared project: alice grants bob, stores the
-/// blobs (encrypt-after-grant), then bob joins via invite. Returns the nodes
-/// and the tickets, ready for bob to fetch.
+/// Two loopback nodes with a shared project: alice grants bob, stores the blobs
+/// (encrypt-after-grant), then bob joins via invite. Returns nodes + tickets.
 async fn blob_pair(sizes: &[usize]) -> Result<(BeelayNode, BeelayNode, Vec<(Vec<u8>, String)>)> {
     let dir = tempfile::tempdir()?;
     let (alice_device, alice_auth_id) = identities(dir.path(), "alice");
@@ -500,9 +496,8 @@ async fn peer_id_spoof_rejected() -> Result<()> {
     Ok(())
 }
 
-/// Synced doc content survives a restart from data_dir: bob syncs, restarts
-/// with the same dir + reloaded auth, and the doc is present WITHOUT any
-/// sync_project call (decrypted straight from the persisted beelay KV).
+/// Synced doc content survives a restart from data_dir: bob restarts with the same
+/// dir + reloaded auth and the doc is present WITHOUT any sync_project call.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_restart_keeps_doc() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -570,10 +565,9 @@ async fn kv_restart_keeps_doc() -> Result<()> {
     Ok(())
 }
 
-/// The accept side refuses peers with no role on the requested project. Since
-/// the delegations arrive over the session rather than in the invite string, a
-/// stranger holding a leaked invite cannot even adopt: the host closes the
-/// session and the failed accept rolls back. The invited member is unaffected.
+/// The accept side refuses peers with no role. Delegations arrive over the session,
+/// not the invite string, so a stranger holding a leaked invite cannot even adopt:
+/// the host closes the session and the failed accept rolls back.
 #[tokio::test(flavor = "multi_thread")]
 async fn stranger_accept_refused() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -648,10 +642,9 @@ async fn stranger_accept_refused() -> Result<()> {
     Ok(())
 }
 
-/// Write enforcement (spec §2): a Read-role member syncs serve-only — the
-/// session completes and the viewer receives the host's content, but the
-/// viewer's uploads land in a throwaway core and never reach the host's
-/// canonical store or other members.
+/// Write enforcement (spec §2): a Read-role member syncs serve-only — the viewer
+/// receives the host's content, but its uploads land in a throwaway core and never
+/// reach the host's canonical store or other members.
 #[tokio::test(flavor = "multi_thread")]
 async fn viewer_cannot_write() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -781,10 +774,9 @@ async fn viewer_cannot_write() -> Result<()> {
     Ok(())
 }
 
-/// Role transitions meet write enforcement (spec §3.4): bob's push lands
-/// while he is an Editor, then a set_role downgrade to Read flips his
-/// sessions to serve-only — his next push evaporates in the scratch core,
-/// a third Editor never sees it, and he still RECEIVES new host content.
+/// Role transitions meet write enforcement (spec §3.4): bob's push lands while he
+/// is an Editor; after a downgrade to Read his next push evaporates in the scratch
+/// core while he still RECEIVES new host content.
 #[tokio::test(flavor = "multi_thread")]
 async fn downgraded_editor_cannot_write() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -936,9 +928,8 @@ async fn downgraded_editor_cannot_write() -> Result<()> {
     Ok(())
 }
 
-/// One endpoint serves plain sync, beelay, and blobs: both handles of a
-/// stack report the same endpoint id, both protocols work between the same
-/// two stacks, and shutdown is exercised from either handle in either order.
+/// One endpoint serves plain sync, beelay, and blobs: both handles report the same
+/// endpoint id, both protocols work, and shutdown works from either handle in either order.
 #[tokio::test(flavor = "multi_thread")]
 async fn bind_stack_single_endpoint() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1132,11 +1123,9 @@ async fn revocation_is_per_project() -> Result<()> {
     Ok(())
 }
 
-/// Blob membership scoping is per project (spec §4): bob is a member of
-/// both "p" and "q" on the same host. Announcing q while requesting p's
-/// hash is refused even while bob holds both grants (cross-project probe),
-/// and after revocation from "p" bob still fetches q's blobs but p's blob
-/// is refused on both dial shapes.
+/// Blob scoping is per project (spec §4): announcing q while requesting p's hash is
+/// refused even while bob holds both grants; after revocation from "p" he still
+/// fetches q's blobs but p's is refused on both dial shapes.
 #[tokio::test(flavor = "multi_thread")]
 async fn blob_scoping_per_project() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1245,11 +1234,9 @@ async fn blob_scoping_per_project() -> Result<()> {
     Ok(())
 }
 
-/// A registry entry whose stored host ticket no longer parses must NOT
-/// present like hosting (spec §5): sync_project fails with the typed
-/// rejoin error instead of "accept an invite first" host behavior. The
-/// registry file is forged in the pre-3-state `Option<String>` layout,
-/// which doubles as the wire-compat check for the RegistryHost enum.
+/// A registry entry whose stored host ticket no longer parses must NOT present like
+/// hosting (spec §5): sync_project fails with the typed rejoin error. The registry
+/// file is forged in the pre-3-state layout, doubling as the RegistryHost wire-compat check.
 #[tokio::test(flavor = "multi_thread")]
 async fn bad_host_ticket_errors_typed() -> Result<()> {
     use linxiv_p2p::beelay::HostTicketError;
@@ -1297,10 +1284,9 @@ fn parked(data_dir: &std::path::Path) -> Vec<(String, String)> {
     postcard::from_bytes(&std::fs::read(path).unwrap()).unwrap()
 }
 
-/// Accepting an invite the host cannot answer is not a failure: the project is
-/// registered empty, the invite is parked on disk, and the park survives a
-/// restart so the join can finish whenever the host turns up. `forget_project`
-/// is the undo for that state — it must clear both halves.
+/// Accepting an invite the host cannot answer is not a failure: the project
+/// registers empty and the parked invite survives a restart. `forget_project` is
+/// the undo for that state — it must clear both halves.
 #[tokio::test(flavor = "multi_thread")]
 async fn offline_accept_parks_invite() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1406,14 +1392,10 @@ async fn offline_accept_parks_invite() -> Result<()> {
     Ok(())
 }
 
-/// Members are granted and invited ONE AT A TIME in the app (add_member then
-/// invite, per member), so the first invite seals the content under an epoch
-/// the second member is not in — and the second invite has nothing pending
-/// left to flush. Without the re-seal in `invite`, carol here fetches every
-/// commit and decrypts none: `applied=0, no_key>0`, an empty mirror forever.
-///
-/// The other tests all add every member before the first invite, which hides
-/// this; keep the sequential order below.
+/// Members are granted and invited ONE AT A TIME in the app, so the first invite
+/// seals content under an epoch the second member is not in; without the re-seal
+/// in `invite`, carol fetches every commit and decrypts none. The other tests add
+/// every member before the first invite, which hides this; keep the sequential order.
 #[tokio::test(flavor = "multi_thread")]
 async fn member_invited_after_sealing_can_still_read() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1538,11 +1520,9 @@ async fn forget_refuses_a_hosted_project() -> Result<()> {
     Ok(())
 }
 
-/// A parked invite is carried into the next sync and dropped once that sync
-/// lands. Forges pending.bin over an already-joined node because bind_local has
-/// no stable address: a genuinely deferred accept records a host address that a
-/// restarted host no longer holds (the real presets::N0 build dials through a
-/// relay keyed on the endpoint id, so it does not have that problem).
+/// A parked invite is carried into the next sync and dropped once that sync lands.
+/// Forges pending.bin over an already-joined node because bind_local has no stable
+/// address; the real presets::N0 build dials through a relay keyed on the endpoint id.
 #[tokio::test(flavor = "multi_thread")]
 async fn parked_invite_drains_on_sync() -> Result<()> {
     let dir = tempfile::tempdir()?;

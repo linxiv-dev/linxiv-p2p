@@ -1,13 +1,8 @@
-//! Capability layer (Phase 2): keyhive-backed per-project groups, delegation,
-//! revocation, and content encryption, plus the cross-signed device binding
-//! that ties an iroh endpoint to a keyhive individual.
-//!
-//! Future form: keyhive's `Local` futures are `!Send`, so this module uses
-//! [`future_form::Sendable`] throughout — everything stays `Send` and plugs
-//! into tokio and the [`crate::sync`] access-check hook without an actor.
-//!
-//! NB: keyhive uses ed25519-dalek 2.x while iroh uses 3.0-rc — different
-//! crates. Key material only ever crosses that boundary as raw 32-byte arrays.
+//! Capability layer: keyhive-backed per-project groups, delegation, revocation,
+//! and content encryption, plus the cross-signed device binding tying an iroh
+//! endpoint to a keyhive individual. Keyhive's `Local` futures are `!Send`, so
+//! everything uses [`future_form::Sendable`]. NB: keyhive uses ed25519-dalek 2.x,
+//! iroh 3.0-rc — key material crosses that boundary only as raw 32-byte arrays.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -54,20 +49,17 @@ pub struct AuthIdentity {
 }
 
 impl AuthIdentity {
-    /// Loads the seed at `path`, generating and persisting a new one (0o600)
-    /// if the file doesn't exist yet. The key IS the keyhive identity, so the
-    /// same path always yields the same individual.
+    /// Loads the seed at `path`, generating and persisting (0o600) when absent.
+    /// The key IS the keyhive identity: same path, same individual.
     pub fn load_or_generate(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::load_or_generate_with_dek(path, None)
     }
 
     // vendor-edit: DEK-wrapped keyhive seed at rest (write-enforcement spec §8
     // gap: the app persists this signing seed in its own file, not state.bin).
-    /// Like [`Self::load_or_generate`], but with `Some(dek)` the seed file is
-    /// AEAD-wrapped under the DEK — same sealed format and one-time plaintext
-    /// migration as the device key. An encrypted file loaded without the
-    /// right DEK fails with an `io::Error` whose source downcasts to
-    /// [`KeyStoreError`].
+    /// Like [`Self::load_or_generate`]; `Some(dek)` AEAD-wraps the seed file — same
+    /// sealed format and one-time plaintext migration as the device key. A missing/wrong
+    /// DEK fails with an `io::Error` whose source downcasts to [`KeyStoreError`].
     pub fn load_or_generate_with_dek(
         path: impl AsRef<Path>,
         dek: Option<&[u8; 32]>,
@@ -103,11 +95,10 @@ impl MemberId {
 /// Domain separator for binding statements; bump on layout changes.
 const BINDING_CONTEXT: &[u8] = b"linxiv/device-binding/v0";
 
-/// A cross-signed statement that one device controls both an iroh endpoint
-/// and a keyhive individual: both public keys, each signing the pair.
-///
-/// A verified binding is how a peer maps `EndpointId -> keyhive member` for
-/// access checks; neither key is ever reused across the two protocols.
+/// A cross-signed statement that one device controls both an iroh endpoint and a
+/// keyhive individual: both public keys, each signing the pair. A verified binding
+/// maps `EndpointId -> keyhive member` for access checks; neither key is ever
+/// reused across the two protocols.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBinding {
     iroh_id: [u8; 32],
@@ -321,11 +312,9 @@ struct ProjectIds {
     doc: DocumentId,
 }
 
-/// One device's capability state: a keyhive instance plus the
-/// `project id -> (group, doc)` registry.
-///
-/// Content keys live on the doc; membership is managed on the group (which is
-/// an admin coparent of the doc, so grants propagate transitively).
+/// One device's capability state: a keyhive instance plus the `project id ->
+/// (group, doc)` registry. Content keys live on the doc; membership is managed on
+/// the group (an admin coparent of the doc, so grants propagate transitively).
 pub struct ProjectAuth {
     keyhive: Kh,
     projects: StdMutex<HashMap<String, ProjectIds>>,
@@ -373,18 +362,16 @@ impl ProjectAuth {
 
     // vendor-edit: keyhive state persistence (archive + project registry).
 
-    /// Restores state persisted under `dir` (starting fresh if the state
-    /// file is absent) and auto-persists there after every mutating op.
-    /// An undecodable state file is an error.
+    /// Restores state persisted under `dir` (fresh if absent) and auto-persists
+    /// after every mutating op. An undecodable state file is an error.
     pub async fn load_or_new(identity: &AuthIdentity, dir: &Path) -> Result<Self> {
         Self::load_or_new_with_dek(identity, dir, None).await
     }
 
     // vendor-edit: encrypted state at rest (write-enforcement spec §8).
-    /// Like [`Self::load_or_new`], but with `Some(dek)` state.bin is sealed
-    /// (XChaCha20-Poly1305) under the DEK; v1 plaintext state is re-persisted
-    /// encrypted on load. Encrypted state loaded without the right DEK fails
-    /// with a downcastable [`KeyStoreError`].
+    /// Like [`Self::load_or_new`]; `Some(dek)` seals state.bin (XChaCha20-Poly1305),
+    /// re-persisting v1 plaintext encrypted on load. A missing/wrong DEK fails with
+    /// a downcastable [`KeyStoreError`].
     pub async fn load_or_new_with_dek(
         identity: &AuthIdentity,
         dir: &Path,
@@ -453,8 +440,7 @@ impl ProjectAuth {
         Ok(auth)
     }
 
-    /// Writes state.bin under the [`Self::load_or_new`] dir via tmp+rename,
-    /// fsyncing the tmp file before rename and the parent dir after;
+    /// Writes state.bin under the [`Self::load_or_new`] dir via tmp+rename+fsync;
     /// no-op for in-memory instances.
     async fn persist(&self) -> Result<()> {
         let Some(dir) = &self.persist_dir else {
@@ -529,9 +515,8 @@ impl ProjectAuth {
         Ok(MemberId(card.id().to_bytes()))
     }
 
-    /// Creates the capability group + encrypted doc for a new project this
-    /// device hosts. This device becomes the group's admin.
-    /// Requires a multi-thread tokio runtime (uses `block_in_place`).
+    /// Creates the capability group + encrypted doc for a new hosted project; this
+    /// device becomes the group's admin. Requires a multi-thread tokio runtime (`block_in_place`).
     pub async fn create_project(&self, project_id: &str) -> Result<()> {
         if self.projects.lock().unwrap().contains_key(project_id) {
             return Err(anyerr!("project {project_id} already exists"));
@@ -612,10 +597,9 @@ impl ProjectAuth {
         self.projects.lock().unwrap().keys().cloned().collect()
     }
 
-    /// Maps `project_id` onto a doc learned via [`Self::ingest_events`]
-    /// (from an invite). Fails if the doc's events haven't been ingested yet.
-    /// With the host's [`Self::group_id`], membership management works here
-    /// too (subject to keyhive's own delegation rules).
+    /// Maps `project_id` onto a doc learned via [`Self::ingest_events`]; fails if
+    /// the doc's events haven't been ingested yet. With the host's [`Self::group_id`],
+    /// membership management works here too.
     pub async fn adopt_project(
         &self,
         project_id: &str,
@@ -855,10 +839,9 @@ impl ProjectAuth {
             })
     }
 
-    /// Everything `member` is authorized to see (visibility-filtered static
-    /// events: delegations, revocations, key ops), as bytes to ship to them.
-    /// Both sides swap these in every session preamble; that exchange, not
-    /// the invite string, is how a joiner learns the doc it will adopt.
+    /// Everything `member` is authorized to see (visibility-filtered static events),
+    /// as bytes to ship to them. Both sides swap these in every session preamble —
+    /// that exchange, not the invite string, is how a joiner learns the doc it adopts.
     pub async fn export_events_for(&self, member: MemberId) -> Result<Vec<u8>> {
         let agent = self
             .keyhive
@@ -886,10 +869,9 @@ impl ProjectAuth {
         Ok(())
     }
 
-    /// Builds a [`crate::ShareNode::set_access_check`] callback from current
-    /// keyhive membership plus verified device bindings: a peer endpoint may
-    /// sync a project iff its bound keyhive member can read that project.
-    /// Unverifiable bindings and unbound endpoints are denied.
+    /// Builds a [`crate::ShareNode::set_access_check`] callback from current keyhive
+    /// membership plus verified device bindings: a peer may sync a project iff its
+    /// bound member can read it. Unverifiable bindings and unbound endpoints are denied.
     pub async fn access_callback(&self, bindings: &[DeviceBinding]) -> AccessCheckFn {
         // ponytail: snapshot allowlist — rebuild and re-set after membership or
         // binding changes. Live keyhive queries need an async bridge; add one

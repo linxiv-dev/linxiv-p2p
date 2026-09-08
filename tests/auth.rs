@@ -49,10 +49,8 @@ fn dual_key_binding() {
     }
 }
 
-/// Alice creates a project, grants bob Edit via contact card, encrypts, and
-/// ships an "invite" (endpoint id + project/doc/group ids + delegation
-/// events); bob ingests,
-/// adopts, and decrypts. Returns the live state for the revocation test.
+/// Alice creates a project, grants bob Edit, encrypts, and ships an "invite"; bob
+/// ingests, adopts, and decrypts. Returns the live state for the revocation test.
 async fn grant_flow() -> Result<(ProjectAuth, ProjectAuth, Vec<u8>)> {
     let dir = tempfile::tempdir()?;
     let (alice_device, alice_auth) = identities(dir.path(), "alice");
@@ -135,19 +133,10 @@ async fn revoke_blocks_new_content() -> Result<()> {
     Ok(())
 }
 
-/// set_role walks bob None -> Read -> Edit -> Read (spec §3.4).
-///
-/// Assertion strategy for the rotation claims, all via encrypt/decrypt
-/// round-trips (the crate's only epoch observable):
-/// - upgrade does NOT rotate: content encrypted BEFORE the upgrade still
-///   decrypts for bob afterwards — his key continuity survives the
-///   revoke + re-grant leg (no eager PCS update).
-/// - downgrade DOES rotate: dave, a second member kept current up to the
-///   moment before the downgrade, gets KeyNotFound on content encrypted
-///   after it — the key state demonstrably advanced past what he holds —
-///   while re-granted bob (and dave, once he ingests the rotation ops)
-///   decrypts that same content: the downgrade re-keyed bob into the fresh
-///   epoch as a reader.
+/// set_role walks bob None -> Read -> Edit -> Read (spec §3.4). Rotation observed
+/// via encrypt/decrypt round-trips: an upgrade does NOT rotate (bob's pre-upgrade
+/// content still decrypts), a downgrade DOES (dave gets KeyNotFound on
+/// post-downgrade content until he ingests the rotation ops; re-granted bob reads it).
 #[tokio::test(flavor = "multi_thread")]
 async fn upgrade_then_downgrade() -> Result<()> {
     let dir = tempfile::tempdir()?;

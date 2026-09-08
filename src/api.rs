@@ -1,18 +1,10 @@
-//! Remote Query Mode transport: JSON request/response plus a paced raw-byte
-//! lane (PDFs) over one iroh ALPN.
-//!
-//! linXiv-agnostic by design: the member/role type `M` and every policy
-//! decision (roles, route groups, Provider Access) live in the caller's
-//! callbacks. This module only enforces the transport rule that matters at
-//! this layer: a peer the member check rejects is refused at the transport —
-//! the connection is closed without answering anything, so a non-member
-//! cannot tell "node offline" from "not admitted".
-//!
-//! Wire shape (one bidi stream per request): the client writes its request
-//! JSON and finishes; the server reads to end (capped), answers, finishes.
-//! JSON answers are a single envelope object. Byte answers are one JSON
-//! header line terminated by `\n` followed by exactly `size` raw bytes,
-//! paced at `rate` bytes/sec.
+//! Remote Query Mode transport: JSON request/response plus a paced raw-byte lane
+//! (PDFs) over one iroh ALPN. Policy (member/role type `M`, route groups) lives in
+//! the caller's callbacks; the transport's one rule is that a rejected peer is
+//! refused silently, so a non-member cannot tell "node offline" from "not admitted".
+//! Wire shape, one bidi stream per request: JSON answers are a single envelope;
+//! byte answers are one `\n`-terminated JSON header line then exactly `size` raw
+//! bytes, paced at `rate` bytes/sec.
 
 use std::{fmt, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 
@@ -45,9 +37,8 @@ const MAX_LANE_PAYLOAD: u64 = 256 * 1024 * 1024;
 
 // --- server ------------------------------------------------------------------
 
-/// Membership gate: `remote endpoint id (string form)` -> the caller's
-/// member/role context, or `None` for "refuse at the transport" (unknown
-/// device, or an admitted device whose role is `none`).
+/// Membership gate: remote endpoint id (string form) -> the caller's member/role
+/// context, or `None` for "refuse at the transport" (unknown device or role `none`).
 pub type MemberCheckFn<M> = Arc<dyn Fn(&str) -> Option<M> + Send + Sync>;
 
 /// Fired with the knocking endpoint id when a connection is refused.
@@ -61,9 +52,8 @@ pub type MaxRequestFn<M> = Arc<dyn Fn(&M) -> usize + Send + Sync>;
 /// There is no application-level receipt: this is the sender's own view.
 pub type TransferLogFn = Arc<dyn Fn(&str, TransferOutcome) + Send + Sync>;
 
-/// Per-request handler: `(member context, raw request bytes)` -> response.
-/// The JSON envelope (`{"status":..,"body":..}` / `{"status":..,"detail":..}`)
-/// is built by the caller; the transport ships it verbatim.
+/// Per-request handler: `(member context, raw request bytes)` -> response. The
+/// JSON envelope is built by the caller; the transport ships it verbatim.
 pub type ApiHandlerFn<M> =
     Arc<dyn Fn(M, Vec<u8>) -> Pin<Box<dyn Future<Output = ApiResponse> + Send>> + Send + Sync>;
 
@@ -120,9 +110,8 @@ impl<M> fmt::Debug for ApiProtocol<M> {
 }
 
 impl<M: Clone + Send + 'static> ApiProtocol<M> {
-    /// `max_request` derives the request-body cap from the admitted member
-    /// (role-aware by design: ~1 MiB for `read`, upload-sized for
-    /// `read-write`); an oversized request is answered with a `413` envelope.
+    /// `max_request` derives the request-body cap from the admitted member (role-aware:
+    /// ~1 MiB for `read`, upload-sized for `read-write`); oversized -> a `413` envelope.
     pub fn new(
         member_check: MemberCheckFn<M>,
         knock_log: KnockLogFn,
@@ -211,12 +200,9 @@ impl<M: Clone + Send + 'static> ProtocolHandler for ApiProtocol<M> {
     }
 }
 
-/// Late-mount slot for [`ApiProtocol`]: iroh routers take protocols only at
-/// build time, but the bind paths run before the app can construct its
-/// handler (it closes over app state). So every bind mounts this empty slot
-/// at [`ALPN`] and the app installs the real handler afterwards. An empty
-/// slot refuses every connection with the same silence a non-member gets —
-/// desktop nodes simply never install anything.
+/// Late-mount slot for [`ApiProtocol`]: iroh routers take protocols only at build
+/// time, so every bind mounts this empty slot at [`ALPN`] and the app installs the
+/// real handler later. An empty slot refuses connections with a non-member's silence.
 #[derive(Debug, Clone, Default)]
 pub struct ApiSlot(Arc<std::sync::Mutex<Option<Arc<dyn DynProtocolHandler>>>>);
 
@@ -240,9 +226,8 @@ impl ProtocolHandler for ApiSlot {
     }
 }
 
-/// Writes `size` bytes from `source`, paced at `rate` bytes/sec with a
-/// sleep-based schedule. `Ok(sent)` on success, `Err(sent)` when the write
-/// failed or the source ran dry before `size`.
+/// Writes `size` bytes from `source`, paced at `rate` bytes/sec. `Ok(sent)` on
+/// success, `Err(sent)` when the write failed or the source ran dry before `size`.
 async fn stream_paced(
     send: &mut SendStream,
     source: &mut (dyn AsyncRead + Send + Unpin),
@@ -302,9 +287,8 @@ pub async fn connect(endpoint: &Endpoint, addr: impl Into<EndpointAddr>) -> Resu
         .context("dialing api node")
 }
 
-/// One JSON request/response round trip on its own stream. `request` is the
-/// ApiRequest object (`{method, path, body}`); the return value is the
-/// server's envelope — including answered errors like `{"status":413,..}`.
+/// One JSON request/response round trip on its own stream; returns the server's
+/// envelope — including answered errors like `{"status":413,..}`.
 pub async fn request(
     conn: &Connection,
     request: &Value,
@@ -327,9 +311,8 @@ pub async fn request(
         .map_err(|e| ApiClientError::Other(anyerr!("response is not valid JSON: {e}")))
 }
 
-/// Byte-lane request: returns the parsed header and a [`ByteLane`] carrying
-/// the declared payload. On an answered error the header is the error
-/// envelope and the lane is empty (`size == 0`).
+/// Byte-lane request: the parsed header plus a [`ByteLane`] carrying the declared
+/// payload. On an answered error the header is the error envelope and `size == 0`.
 pub async fn request_bytes(
     conn: &Connection,
     request: &Value,
@@ -351,9 +334,8 @@ pub async fn request_bytes(
     Ok((header, ByteLane { recv, size }))
 }
 
-/// The raw-byte half of a [`request_bytes`] answer: exactly [`Self::size`]
-/// bytes. No read deadline — a paced transfer legitimately takes
-/// `eta_seconds`; the caller owns any timeout policy.
+/// The raw-byte half of a [`request_bytes`] answer: exactly [`Self::size`] bytes.
+/// No read deadline — a paced transfer legitimately takes `eta_seconds`.
 pub struct ByteLane {
     recv: RecvStream,
     size: u64,
@@ -445,9 +427,8 @@ fn refusal_or(conn: &Connection, e: AnyError) -> ApiClientError {
     }
 }
 
-/// Bytes up to a consumed-and-excluded `\n`, or up to clean end-of-stream
-/// (the answered-error case ships a bare envelope with no newline).
-/// `None` if the stream finished with no bytes at all.
+/// Bytes up to a consumed-and-excluded `\n`, or up to clean end-of-stream (an
+/// answered error ships a bare envelope, no newline). `None` if no bytes at all.
 async fn read_header_line(recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
     // ponytail: byte-at-a-time reads; the header is ~100 bytes.
     let mut line = Vec::new();
@@ -472,12 +453,9 @@ async fn read_header_line(recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
 
 // --- node address ------------------------------------------------------------
 
-/// A compact copyable locator for a headless node: endpoint id + relay URL.
-/// A locator, not a capability — possessing it grants nothing; the node's
-/// member check alone decides access.
-///
-/// Round-trips through its `Display`/`FromStr` string form
-/// (`linxivnode...`, same encoding family as [`crate::ShareTicket`]).
+/// A compact copyable locator for a headless node: endpoint id + relay URL. A
+/// locator, not a capability — possessing it grants nothing; the node's member
+/// check alone decides access. Round-trips through `Display`/`FromStr` (`linxivnode...`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeAddress {
     id: EndpointId,

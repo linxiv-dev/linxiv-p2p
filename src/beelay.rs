@@ -214,16 +214,11 @@ impl std::error::Error for HostUnreachable {}
 // --- invite ------------------------------------------------------------------
 
 /// A pasteable invite for one member: host address and the project/doc ids.
-///
-/// Create it with [`BeelayNode::invite`] AFTER granting the member via
-/// [`ProjectAuth::add_member`] — content is encrypted at invite time so it
-/// lands in an epoch the member can read (grant-before-encrypt, keyhive #136).
-///
-/// The keyhive delegation events the joiner needs are NOT in here: the
-/// session preamble already exports the same bytes on every connection
-/// (see `keyhive_preamble`), so [`BeelayNode::accept_invite`] dials and
-/// adopts from those instead. Inlining them made the string grow without
-/// bound — ~900 chars per member and ~4k per key rotation, forever.
+/// Create it with [`BeelayNode::invite`] AFTER granting the member — content is
+/// encrypted at invite time so it lands in an epoch the member can read
+/// (grant-before-encrypt, keyhive #136). The keyhive delegation events are NOT in
+/// here: the session preamble exports the same bytes on every connection, so
+/// [`BeelayNode::accept_invite`] dials and adopts from those instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInvite {
     endpoint: EndpointTicket,
@@ -359,11 +354,9 @@ fn key_blob(key: &StorageKey) -> Option<String> {
     }
 }
 
-/// Owns kv.bin: [`Core::persist_kv`] publishes whole-map snapshots into `tx`;
-/// one writer task writes them in order, newest snapshot wins. `written`
-/// reports the last snapshot attempted and whether it hit disk, so callers
-/// that need durability-before-proceeding (see [`BeelayNode::store_blob`])
-/// can wait on it.
+/// Owns kv.bin: [`Core::persist_kv`] publishes whole-map snapshots into `tx`; one
+/// writer task writes them in order, newest wins. `written` reports the last
+/// snapshot attempted, for callers needing durability-before-proceeding.
 struct KvWriter {
     tx: tokio::sync::watch::Sender<(u64, Vec<u8>)>,
     written: tokio::sync::watch::Receiver<(u64, bool)>,
@@ -527,11 +520,9 @@ impl Core {
         })
     }
 
-    /// A session-local, memory-only core over a snapshot of `storage` (and
-    /// the blob map that scopes it): serves the snapshot's commits under the
-    /// same doc ids (beelay has no doc registry — storage keys ARE the doc),
-    /// and everything a peer uploads into it evaporates on drop (`kv: None`,
-    /// nothing reaches disk). Serve-only Read-role sessions.
+    /// A session-local, memory-only core over a snapshot of `storage` and its blob
+    /// map: serves the snapshot's commits under the same doc ids, and everything a
+    /// peer uploads evaporates on drop (`kv: None`). Serve-only Read-role sessions.
     fn scratch(
         peer_id: PeerId,
         storage: BTreeMap<StorageKey, Vec<u8>>,
@@ -857,15 +848,10 @@ impl Shared {
         self.flush_inner(project_id, false).await
     }
 
-    /// Re-encrypts the WHOLE history under the current epoch, on top of
-    /// whatever is already sealed.
-    ///
-    /// This is the keyhive #136 workaround (see the repro test): a member
-    /// granted after content was sealed holds no key for those commits, and
-    /// nothing re-keys them — the joiner fetches every commit and decrypts
-    /// none. Re-sealing after the grant gives them ciphertext they can open.
-    /// The stale commits stay in the doc; the reader counts them as no-key
-    /// once and applies the fresh ones.
+    /// Re-encrypts the WHOLE history under the current epoch, on top of whatever is
+    /// already sealed — the keyhive #136 workaround: a member granted after content
+    /// was sealed holds no key for those commits and nothing re-keys them. Stale
+    /// commits stay; the reader counts them no-key once and applies the fresh ones.
     async fn reseal(&self, project_id: &str) -> Result<()> {
         self.flush_inner(project_id, true).await
     }
@@ -1168,13 +1154,9 @@ async fn send_envelopes(
 // --- node ------------------------------------------------------------------------
 
 /// An encrypted-share node: iroh transport + beelay sync engine + keyhive
-/// capability layer + a registry of plaintext automerge project docs.
-///
-/// Flow: [`Self::create_shared_project`] -> exchange contact cards +
-/// [`ProjectAuth::add_member`] -> [`Self::invite`] -> peer
-/// [`Self::accept_invite`] + [`Self::sync_project`]. Revoke via
-/// [`ProjectAuth::revoke_member`] (rotates the key), confirm with
-/// [`ProjectAuth::query_access`].
+/// capability layer + a registry of plaintext automerge project docs. Flow:
+/// [`Self::create_shared_project`] -> [`ProjectAuth::add_member`] ->
+/// [`Self::invite`] -> peer [`Self::accept_invite`] + [`Self::sync_project`].
 pub struct BeelayNode {
     router: Router,
     shared: Arc<Shared>,
@@ -1190,9 +1172,8 @@ impl fmt::Debug for BeelayNode {
 }
 
 impl BeelayNode {
-    /// Binds with n0 discovery + relays: dialable by bare [`EndpointId`].
-    /// `data_dir` = where beelay commits, the project registry, and blobs
-    /// persist; `None` keeps everything in memory (lost on drop).
+    /// Binds with n0 discovery + relays. `data_dir` holds beelay commits, the
+    /// registry, and blobs; `None` keeps everything in memory (lost on drop).
     pub async fn bind(
         identity: &DeviceIdentity,
         auth_identity: &AuthIdentity,
@@ -1397,12 +1378,10 @@ impl BeelayNode {
         &self.shared.auth
     }
 
-    /// Registers `doc` as a new shared project: creates the keyhive
-    /// group/doc and an empty beelay doc. Content is NOT encrypted here —
-    /// changes are flushed lazily at invite/sync time so they land in an
-    /// epoch every current member can read (grant-before-encrypt ordering;
-    /// upstream keyhive #136 makes pre-grant ciphertext unreadable to
-    /// later-added members).
+    /// Registers `doc` as a new shared project: creates the keyhive group/doc and
+    /// an empty beelay doc. Content is NOT encrypted here — changes flush lazily at
+    /// invite/sync time so they land in an epoch every current member can read
+    /// (grant-before-encrypt; keyhive #136).
     pub async fn create_shared_project(&self, project_id: &str, doc: Automerge) -> Result<()> {
         self.shared.auth.create_project(project_id).await?;
         let mut state = self.shared.state.lock().await;
@@ -1427,10 +1406,8 @@ impl BeelayNode {
     }
 
     /// A pasteable invite for `member`, who must already hold a role from
-    /// [`ProjectAuth::add_member`]. The project's whole history is re-encrypted
-    /// here, after the grant, so the invitee can decrypt everything it will
-    /// fetch — content sealed before the grant is unreadable to them forever
-    /// otherwise (keyhive #136; see [`Shared::reseal`]).
+    /// [`ProjectAuth::add_member`]. The whole history is re-encrypted here, after
+    /// the grant, so the invitee can decrypt everything it fetches (keyhive #136).
     pub async fn invite(&self, project_id: &str, member: MemberId) -> Result<String> {
         // the grant used to be implicit in the event export; check it here so
         // inviting before add_member fails at mint time, not at the joiner's
@@ -1476,23 +1453,13 @@ impl BeelayNode {
         Ok(invite.encode_string())
     }
 
-    /// Registers the project against the host's address, adopts the keyhive
-    /// doc, and returns the project id; call [`Self::sync_project`] to fetch
-    /// the content.
-    ///
-    /// This dials the host — the invite carries no keyhive events, so the
-    /// session preamble is where the delegations come from. Two consequences:
-    ///
-    /// - A host that **refuses** this peer (never granted, or revoked) fails
-    ///   here rather than on a later sync, and leaves no local trace.
-    /// - A host that is merely **unreachable** does NOT fail. The invite says
-    ///   nothing about whether the peer is welcome, so it is parked on disk
-    ///   and this returns `Ok`; the next [`Self::sync_project`] finishes the
-    ///   adoption. Pasting an invite offline is therefore a supported flow —
-    ///   the project exists locally, empty, until the host answers.
-    ///
-    /// Re-accepting a known project (retry, rejoin after leave) refreshes the
-    /// host address without touching its doc.
+    /// Registers the project against the host's address, adopts the keyhive doc,
+    /// and returns the project id; [`Self::sync_project`] fetches the content. The
+    /// invite carries no keyhive events, so this dials the host: a refusing host
+    /// (never granted, or revoked) fails here with no local trace, while an
+    /// unreachable one parks the invite on disk and returns `Ok` — the next sync
+    /// finishes the adoption. Re-accepting a known project refreshes the host
+    /// address without touching its doc.
     pub async fn accept_invite(&self, raw: &str) -> Result<String> {
         let invite: ProjectInvite = raw.parse().map_err(|e| anyerr!("malformed invite: {e}"))?;
         let host = ProjectHost::Member(invite.endpoint.endpoint_addr().clone());
@@ -1572,10 +1539,9 @@ impl BeelayNode {
         }
     }
 
-    /// Re-encrypt a hosted project's whole history under the current epoch, so
-    /// every current member can read all of it. [`Self::invite`] does this
-    /// automatically; this is the repair for shares invited before that, whose
-    /// members are stuck fetching commits they have no key for.
+    /// Re-encrypt a hosted project's whole history under the current epoch.
+    /// [`Self::invite`] does this automatically; this repairs shares invited
+    /// before that, whose members fetch commits they have no key for.
     pub async fn reseal_project(&self, project_id: &str) -> Result<()> {
         {
             let state = self.shared.state.lock().await;
@@ -1592,20 +1558,11 @@ impl BeelayNode {
         self.shared.reseal(project_id).await
     }
 
-    /// Drop every local trace of a joined project: its registry entry (doc,
-    /// host address, commit maps) and any parked invite. Returns whether
-    /// anything was registered.
-    ///
-    /// This is the undo for [`Self::accept_invite`]. Leaving a share without it
-    /// keeps the registration, so a later re-accept takes the "known project"
-    /// path and REUSES the old document — including commits that never
-    /// decrypted. Forgetting first makes the rejoin a fresh adoption.
-    ///
-    /// Refuses a project this node hosts: unpublishing is the host-side undo.
-    ///
-    /// The encrypted commits stay in the beelay KV — this drops the plaintext
-    /// doc and the mapping that finds them, which is what a rejoin needs; it is
-    /// not a secure erase.
+    /// Drop every local trace of a joined project (doc, host address, commit maps,
+    /// parked invite); returns whether anything was registered. The undo for
+    /// [`Self::accept_invite`] — without it a re-accept reuses the old document,
+    /// undecrypted commits included. Refuses a project this node hosts. Encrypted
+    /// commits stay in the beelay KV; this is not a secure erase.
     pub async fn forget_project(&self, project_id: &str) -> Result<bool> {
         let existed = {
             let mut state = self.shared.state.lock().await;
@@ -1645,25 +1602,18 @@ impl BeelayNode {
         state.projects.get(project_id).map(|p| p.doc.fork())
     }
 
-    /// True while an [`Self::accept_invite`] for `project_id` is still parked
-    /// because the host could not be reached: the project is registered but
-    /// unadopted and its doc is empty. The next [`Self::sync_project`] that
-    /// connects clears it.
+    /// True while an [`Self::accept_invite`] for `project_id` is still parked (host
+    /// unreachable): registered but unadopted, empty doc. The next connecting sync clears it.
     pub fn join_pending(&self, project_id: &str) -> bool {
         self.shared.pending.lock().unwrap().contains_key(project_id)
     }
 
-    /// Dials the project's host and runs one full session: keyhive preamble,
-    /// beelay handshake, bidirectional sedimentree sync (local commits
-    /// upload, remote commits download), then decrypt-and-apply. Local edits
-    /// are flushed (encrypted) before dialing so the preamble carries any
-    /// CGKA ops the encryption produced. A host that closes the connection
-    /// with the refusal code (this peer holds no role on the requested
-    /// project, e.g. revoked) surfaces as [`JoinError::Refused`].
-    ///
-    /// Also where an accept that could not reach the host finishes: a parked
-    /// invite is carried into this session, so the first sync that connects
-    /// completes the join and fetches the content together.
+    /// Dials the project's host and runs one full session: keyhive preamble, beelay
+    /// handshake, bidirectional sedimentree sync, then decrypt-and-apply. Local
+    /// edits flush (encrypted) before dialing so the preamble carries their CGKA
+    /// ops. A refusal-code close (no role, e.g. revoked) surfaces as
+    /// [`JoinError::Refused`]. A parked invite is carried into this session, so
+    /// the first sync that connects completes the join.
     pub async fn sync_project(
         &self,
         project_id: &str,
@@ -1688,13 +1638,9 @@ impl BeelayNode {
         Ok(outcome)
     }
 
-    /// One session against the project's host.
-    ///
-    /// `adopt` carries an invite's `(keyhive_doc, group)` for the joining path,
-    /// adopted once the preamble has ingested the host's delegation events.
-    /// `sync_content` runs the sedimentree exchange; `accept_invite` turns it
-    /// off so [`Self::sync_project`] stays the call that fetches (and reports)
-    /// the content.
+    /// One session against the project's host. `adopt` carries an invite's
+    /// `(keyhive_doc, group)`, adopted once the preamble ingested the host's events;
+    /// `sync_content` toggles the sedimentree exchange (off for `accept_invite`).
     async fn sync_project_inner(
         &self,
         project_id: &str,
@@ -1871,11 +1817,9 @@ impl BeelayNode {
         Ok(outcome)
     }
 
-    /// Encrypts `bytes` under the project key and serves the ciphertext as an
-    /// iroh blob. Returns a pasteable ticket for [`Self::fetch_blob`] /
-    /// [`Self::read_blob`]. Store AFTER granting members (same
-    /// grant-before-encrypt ordering as project content, keyhive #136) and
-    /// hand out invites after storing so their events cover this epoch.
+    /// Encrypts `bytes` under the project key and serves the ciphertext as an iroh
+    /// blob; returns a pasteable ticket. Store AFTER granting members
+    /// (grant-before-encrypt, keyhive #136) and hand out invites after storing.
     pub async fn store_blob(&self, project_id: &str, bytes: &[u8]) -> Result<String> {
         let sealed = self.shared.auth.encrypt(project_id, bytes).await?;
         // vendor-edit: claim the blob for this project in the blob -> doc
@@ -1909,22 +1853,17 @@ impl BeelayNode {
         Ok(BlobTicket::new(self.addr(), tag.hash, BlobFormat::Raw).to_string())
     }
 
-    /// Downloads the (still-encrypted) blob behind `ticket` into the local
-    /// store, verified against its hash; the transfer is aborted once more
-    /// than `max_bytes` of payload has arrived. Transfer only — decrypt by
-    /// calling [`Self::read_blob`], so fetching can happen before/without
-    /// access.
-    ///
-    /// Announces no project (empty announce frame), so the provider gates
-    /// the requested hash against this member's role on the blob's own
-    /// project. Prefer [`Self::fetch_blob_scoped`] when the project is known.
+    /// Downloads the still-encrypted blob behind `ticket` into the local store,
+    /// hash-verified and aborted past `max_bytes`. Transfer only — decrypt via
+    /// [`Self::read_blob`]. Announces no project, so the provider gates the hash
+    /// against this member's role on the blob's own project; prefer
+    /// [`Self::fetch_blob_scoped`] when the project is known.
     pub async fn fetch_blob(&self, ticket: &str, max_bytes: u64) -> Result<()> {
         self.fetch_blob_inner(None, ticket, max_bytes).await
     }
 
-    /// [`Self::fetch_blob`] with the dial announced for `project_id`
-    /// (spec §4): the provider serves the blob only if it belongs to that
-    /// project and this member holds Read or better on it.
+    /// [`Self::fetch_blob`] with the dial announced for `project_id` (spec §4): the
+    /// provider serves the blob only if it belongs to that project and this member holds Read+.
     pub async fn fetch_blob_scoped(
         &self,
         project_id: &str,
@@ -1981,9 +1920,8 @@ impl BeelayNode {
         Err(anyerr!("blob fetch ended without completing"))
     }
 
-    /// Whether `ticket`'s blob is already in the local store, without
-    /// attempting to decrypt it — lets a caller tell "not fetched yet" apart
-    /// from a decrypt failure.
+    /// Whether `ticket`'s blob is already in the local store, without decrypting —
+    /// tells "not fetched yet" apart from a decrypt failure.
     pub async fn has_blob(&self, ticket: &str) -> bool {
         let Ok(ticket) = ticket.parse::<BlobTicket>() else {
             return false;
@@ -1991,8 +1929,7 @@ impl BeelayNode {
         self.blobs.has(ticket.hash()).await.unwrap_or(false)
     }
 
-    /// Decrypts a locally-stored blob ([`Self::store_blob`]d here or
-    /// [`Self::fetch_blob`]ed) back to the original bytes; errors if the
+    /// Decrypts a locally-stored blob back to the original bytes; errors if the
     /// stored ciphertext exceeds `max_bytes`.
     pub async fn read_blob(
         &self,
@@ -2018,9 +1955,8 @@ impl BeelayNode {
             .map_err(|e| AnyError::from_std(BlobError::Decrypt(e)))
     }
 
-    /// Graceful shutdown: stops accepting and closes the endpoint, then
-    /// waits for the kv writer's final flush. The router also shuts the
-    /// blob store down (its `BlobsProtocol` handler).
+    /// Graceful shutdown: stops accepting, closes the endpoint, then waits for the
+    /// kv writer's final flush. The router also shuts the blob store down.
     pub async fn shutdown(&self) -> Result<()> {
         let result = self.router.shutdown().await.std_context("router shutdown");
         let kv = {
@@ -2037,11 +1973,9 @@ impl BeelayNode {
 
 // --- single-endpoint stack ----------------------------------------------------------
 
-/// Binds the whole share stack on ONE iroh endpoint and router — plain sync
-/// ([`crate::ALPN`]), beelay ([`BEELAY_ALPN`]), and blobs — so the device
-/// identity announces a single address instead of two endpoints flapping.
-/// Router shutdown is shared between [`ShareNode::shutdown`] and
-/// [`BeelayNode::shutdown`].
+/// Binds the whole share stack on ONE iroh endpoint and router — plain sync,
+/// beelay, and blobs — so the device announces a single address. Router shutdown
+/// is shared between [`ShareNode::shutdown`] and [`BeelayNode::shutdown`].
 pub async fn bind_stack(
     identity: &DeviceIdentity,
     auth_identity: &AuthIdentity,
@@ -2427,9 +2361,8 @@ mod tests {
     use super::*;
     use automerge::{ROOT, transaction::Transactable};
 
-    /// kv.bin holds storage + blob map in one combined payload (so one
-    /// tmp+rename keeps them consistent); the pre-combined layout (entries-only
-    /// kv.bin + separate blob_docs.bin) must still load.
+    /// kv.bin holds storage + blob map in one combined payload (one tmp+rename keeps
+    /// them consistent); the pre-combined two-file layout must still load.
     #[tokio::test]
     async fn kv_combined_format_roundtrip_and_legacy_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -2466,9 +2399,8 @@ mod tests {
         assert_eq!(reloaded.blob_docs, core.blob_docs);
     }
 
-    /// The flush-side map (change -> commit, parents = mapped deps) must be
-    /// exactly rebuildable on the receive side from the commits alone, even
-    /// when they arrive in reverse order.
+    /// The flush-side map (change -> commit, parents = mapped deps) must be exactly
+    /// rebuildable on the receive side from the commits alone, even in reverse order.
     #[test]
     fn change_commit_mapping_roundtrip() {
         let mut doc = Automerge::new();

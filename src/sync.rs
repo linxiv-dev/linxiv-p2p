@@ -44,9 +44,8 @@ pub(crate) const MAX_SYNC_ROUNDS: usize = 10_000;
 
 // --- device identity -------------------------------------------------------
 
-/// Persistent device identity: an iroh secret key stored on disk.
-///
-/// The [`EndpointId`] derived from it is the device's share identity.
+/// Persistent device identity: an iroh secret key stored on disk. The derived
+/// [`EndpointId`] is the device's share identity.
 #[derive(Debug, Clone)]
 pub struct DeviceIdentity {
     secret: SecretKey,
@@ -60,11 +59,9 @@ impl DeviceIdentity {
     }
 
     // DEK-wrapped device key at rest (write-enforcement spec §8).
-    /// Like [`Self::load_or_generate`], but with `Some(dek)` the key file is
-    /// AEAD-wrapped (XChaCha20-Poly1305) under the DEK; a legacy plaintext
-    /// file is rewritten encrypted once. An encrypted file loaded without
-    /// the right DEK fails with an `io::Error` whose source downcasts to
-    /// [`KeyStoreError`].
+    /// Like [`Self::load_or_generate`]; `Some(dek)` AEAD-wraps the key file
+    /// (XChaCha20-Poly1305), migrating legacy plaintext once. A missing/wrong DEK
+    /// fails with an `io::Error` whose source downcasts to [`KeyStoreError`].
     #[cfg(feature = "encrypted-store")]
     pub fn load_or_generate_with_dek(
         path: impl AsRef<Path>,
@@ -112,14 +109,10 @@ pub(crate) fn write_key(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 // vendor-edit: shared 32-byte seed-file store — device.key and the keyhive
 // auth key use the same sealed format and legacy-plaintext migration.
-/// Loads the 32-byte seed at `path`, creating it via `generate` (parent dirs
-/// included) when absent. With `Some(dek)` (under `encrypted-store`) the file
-/// is AEAD-wrapped; a legacy plaintext file is rewritten encrypted once, and
-/// an encrypted file loaded without the right DEK fails with an `io::Error`
-/// whose source downcasts to [`KeyStoreError`].
-///
-/// `_dek` is only read under `encrypted-store`; the underscore keeps the
-/// plaintext-only build warning-free.
+/// Loads the 32-byte seed at `path`, creating it via `generate` when absent. With
+/// `Some(dek)` the file is AEAD-wrapped (legacy plaintext migrates once); a
+/// missing/wrong DEK fails with an `io::Error` downcasting to [`KeyStoreError`].
+/// `_dek` is only read under `encrypted-store` (underscore keeps other builds warning-free).
 pub(crate) fn load_or_generate_seed(
     path: &Path,
     _dek: Option<&[u8; 32]>,
@@ -184,9 +177,8 @@ pub(crate) fn load_or_generate_seed(
 #[cfg(feature = "encrypted-store")]
 const DEVICE_KEY_MAGIC: &[u8] = b"linxiv/enc-key/v1";
 
-/// Typed encrypted-store failure, surfaced as the `io::Error` source
-/// (device key) or the direct [`AnyError`] payload (keyhive state) so
-/// callers can `downcast_ref::<KeyStoreError>()` it.
+/// Typed encrypted-store failure, surfaced as the `io::Error` source (device key)
+/// or the direct [`AnyError`] payload (keyhive state) so callers can downcast it.
 #[cfg(feature = "encrypted-store")]
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyStoreError {
@@ -286,9 +278,8 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<std::f
 
 // --- access check ------------------------------------------------------------
 
-/// Callback consulted before serving a project sync: `(peer, project_id) ->
-/// allowed?`. Deliberately keyhive-free so this module never depends on the
-/// capability layer; the `auth` module builds one from its membership state.
+/// Callback consulted before serving a project sync: `(peer, project_id) -> allowed?`.
+/// Deliberately keyhive-free; the `auth` module builds one from its membership state.
 pub type AccessCheckFn = Arc<dyn Fn(EndpointId, &str) -> bool + Send + Sync>;
 
 #[derive(Clone, Default)]
@@ -313,7 +304,6 @@ impl fmt::Debug for AccessCheck {
 // --- share ticket ----------------------------------------------------------
 
 /// A pasteable invite: the host's [`EndpointAddr`] plus the project id.
-///
 /// Round-trips through its `Display`/`FromStr` string form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShareTicket {
@@ -382,10 +372,9 @@ impl FromStr for ShareTicket {
 
 // --- custom relay ------------------------------------------------------------
 
-/// A self-hosted relay to dial instead of n0's public ones: url plus an
-/// optional bearer token for a relay configured with `access = shared_token`
-/// (see TODO.md's self-hosted relay access-control design). n0 discovery
-/// (DNS endpoint lookup) stays on — only the relay hop is swapped.
+/// A self-hosted relay to dial instead of n0's public ones: url + optional bearer
+/// token for `access = shared_token` relays (TODO.md's relay access-control design).
+/// n0 discovery stays on — only the relay hop is swapped.
 #[derive(Debug, Clone)]
 pub struct CustomRelay {
     url: RelayUrl,
@@ -521,17 +510,15 @@ impl ShareNode {
         self.router.endpoint()
     }
 
-    /// Installs (or replaces) the access check consulted before serving any
-    /// project sync; a denied peer's stream is rejected. Belt-and-braces with
-    /// app-level checks — build one from the capability layer with
-    /// [`crate::auth::ProjectAuth::access_callback`].
+    /// Installs (or replaces) the access check consulted before serving any project
+    /// sync; a denied peer's stream is rejected. Build one from the capability layer
+    /// via [`crate::auth::ProjectAuth::access_callback`].
     pub fn set_access_check(&self, check: AccessCheckFn) {
         *self.access_check.0.lock().unwrap() = Some(check);
     }
 
-    /// Installs the Remote Query Mode handler served at [`crate::api::ALPN`]
-    /// on this node's endpoint. Until installed, every api connection is
-    /// refused at the transport (the posture desktop nodes keep forever).
+    /// Installs the Remote Query Mode handler served at [`crate::api::ALPN`]. Until
+    /// installed, every api connection is refused (the posture desktop nodes keep forever).
     pub fn set_api_protocol(&self, handler: impl Into<Box<dyn DynProtocolHandler>>) {
         self.api_slot.install(handler);
     }
@@ -555,14 +542,10 @@ impl ShareNode {
             .map(|d| d.fork())
     }
 
-    /// A pasteable invite for a registered project, carrying this node's
-    /// current address. On a discovery-bound node ([`Self::bind`] /
-    /// [`Self::bind_custom_relay`]) direct addrs are dropped once a relay is
-    /// known — id + relay is enough to dial, and shipping LAN/VPN addrs leaks
-    /// them and roughly doubles the ticket. Deliberate tradeoff: a short
-    /// (relay-only) ticket needs discovery or the relay reachable to dial, so
-    /// offline-LAN joins should use [`Self::bind_local`], whose tickets keep
-    /// the full addr. If no relay is known yet, the full addr is kept — a
+    /// A pasteable invite for a registered project. On a discovery-bound node,
+    /// direct addrs are dropped once a relay is known — shipping LAN/VPN addrs
+    /// leaks them. Offline-LAN joins should use [`Self::bind_local`], whose tickets
+    /// keep the full addr; with no relay known yet the full addr is kept, since a
     /// ticket must always carry at least one transport addr.
     // ponytail: no always-short/always-full knob; add one if the relay-only
     // heuristic bites real users.
@@ -577,9 +560,8 @@ impl ShareNode {
         Ok(ShareTicket::new(addr, project_id))
     }
 
-    /// Joins (or re-syncs) a shared project: dials the host in the ticket and
-    /// runs one sync session. If this node doesn't have the project yet, it
-    /// starts from an empty document.
+    /// Joins (or re-syncs) a shared project: dials the ticket's host and runs one
+    /// sync session, starting from an empty document when the project is new here.
     pub async fn join(&self, ticket: &ShareTicket) -> Result<(), JoinError> {
         self.projects
             .lock()
@@ -690,9 +672,8 @@ impl ProtocolHandler for SyncProtocol {
 
 // --- lockstep automerge sync -----------------------------------------------
 
-/// One lockstep sync session over an open bidi stream: each round every side
-/// sends one optional message and receives one; done when both send `None` in
-/// the same round. `initiate` picks send-first vs receive-first.
+/// One lockstep sync session over an open bidi stream: each round both sides send
+/// and receive one optional message; done when both send `None`. `initiate` picks send-first.
 async fn run_sync(
     projects: &Projects,
     project_id: &str,
@@ -783,9 +764,8 @@ pub(crate) async fn send_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-/// `None` for a zero-length frame. The whole frame (length prefix + body)
-/// must arrive within [`RECV_TIMEOUT`] — every protocol read in this crate
-/// routes through here, so this is the single deadline for all of them.
+/// `None` for a zero-length frame. The whole frame must arrive within [`RECV_TIMEOUT`]
+/// — every protocol read in this crate routes through here, the single deadline for all.
 pub(crate) async fn recv_frame(recv: &mut RecvStream) -> Result<Option<Vec<u8>>> {
     recv_frame_max(recv, MAX_FRAME).await
 }
@@ -815,9 +795,8 @@ pub(crate) async fn recv_frame_max(recv: &mut RecvStream, max_len: u64) -> Resul
     .map_err(|_| anyerr!("timed out waiting for peer frame"))?
 }
 
-/// Keeps only the relay entries of `addr`; if that would leave zero transport
-/// addrs (no relay known yet), keeps the full addr so the ticket stays
-/// dialable.
+/// Keeps only the relay entries of `addr`; if that would leave zero transport addrs
+/// (no relay known yet), keeps the full addr so the ticket stays dialable.
 fn relay_only(mut addr: EndpointAddr) -> EndpointAddr {
     if addr.addrs.iter().any(TransportAddr::is_relay) {
         addr.addrs.retain(TransportAddr::is_relay);

@@ -17,9 +17,8 @@ fn pdf_bytes() -> Vec<u8> {
     (0..PDF_SIZE).map(|i| (i % 251) as u8).collect()
 }
 
-/// Echo handler: `path == "/pdf"` answers on the byte lane (`"/huge"`: a
-/// lane declaring an absurd size), anything else echoes the request back
-/// inside a 200 envelope.
+/// Echo handler: `path == "/pdf"` answers on the byte lane (`"/huge"` declares an
+/// absurd size); anything else echoes the request back inside a 200 envelope.
 fn handler() -> api::ApiHandlerFn<String> {
     Arc::new(|member: String, body: Vec<u8>| {
         Box::pin(async move {

@@ -1,5 +1,4 @@
 //! linXiv P2P sharing: iroh transport + (flagged) keyhive capabilities + beelay sync.
-//!
 //! App code uses only this root interface; `auth`/`sync` internals never leak.
 
 pub mod api;
