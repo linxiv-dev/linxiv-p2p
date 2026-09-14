@@ -27,7 +27,7 @@ auth-keyhive = [
 sync-beelay = ["auth-keyhive", "dep:beelay-core", "dep:blake3", "dep:iroh-blobs"]
 
 [dependencies]
-automerge = "0.10.0"
+automerge = "0.11.0"
 iroh = "1.0.2"
 iroh-tickets = "1.0.0"
 n0-error = "1.0.0"
