@@ -1,9 +1,12 @@
 #![cfg(feature = "sync-beelay")]
 
 use anyhow::Result;
+use std::str::FromStr;
+
 use automerge::{Automerge, ROOT, ReadDoc, transaction::Transactable};
+use iroh_tickets::{Ticket, endpoint::EndpointTicket};
 use linxiv_p2p::{
-    BeelayNode, DeviceIdentity,
+    BeelayNode, DeviceIdentity, ProjectInvite,
     auth::{AuthIdentity, DecryptError, DeviceBinding, ProjectAuth, Role},
     bind_stack_local,
 };
@@ -1595,6 +1598,155 @@ async fn parked_invite_drains_on_sync() -> Result<()> {
     );
 
     for node in [alice, bob] {
+        node.shutdown().await.map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// Reader invited, upgraded to Editor, then the host goes offline before the
+/// member pastes the code. The accept parks, the member edits the empty local
+/// copy, and once the host is back the join lands and the offline edit uploads.
+/// The code is minted BEFORE the upgrade, as the GUI does. bind_local restarts
+/// the host on a new address, so the test re-points that same code at it.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgraded_editor_joins_while_host_offline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (hoster_device, hoster_auth_id) = identities(dir.path(), "hoster");
+    let (bob_device, bob_auth_id) = identities(dir.path(), "bob");
+    let hoster_data = dir.path().join("hoster-data");
+    let hoster_auth_dir = dir.path().join("hoster-auth");
+    let hoster_auth = ProjectAuth::load_or_new(&hoster_auth_id, &hoster_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_auth = ProjectAuth::new(&bob_auth_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let bob_member = hoster_auth
+        .receive_contact_card(&bob_auth.contact_card().await.map_err(anyhow::Error::msg)?)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let hoster = BeelayNode::bind_local(
+        &hoster_device,
+        &hoster_auth_id,
+        hoster_auth,
+        Some(&hoster_data),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let bob = BeelayNode::bind_local(&bob_device, &bob_auth_id, bob_auth, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut doc = Automerge::new();
+    put(&mut doc, "title", "Promoted Offline");
+    hoster
+        .create_shared_project("proj", doc)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    hoster
+        .auth()
+        .add_member("proj", bob_member, Role::Read)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    // the GUI mints the code while bob is still a Reader, then upgrades
+    let invite = hoster
+        .invite("proj", bob_member)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    hoster
+        .auth()
+        .set_role("proj", bob_member, Role::Edit)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    // the host goes offline; bob gets the code out of band and pastes it
+    hoster.shutdown().await.map_err(anyhow::Error::msg)?;
+    drop(hoster);
+    assert_eq!(
+        bob.accept_invite(&invite)
+            .await
+            .map_err(anyhow::Error::msg)?,
+        "proj"
+    );
+    assert!(bob.join_pending("proj"), "the accept should have parked");
+
+    // bob edits his empty local copy while the join is still parked
+    bob.with_doc("proj", |d| put(d, "bob_offline", "written while host away"))
+        .await
+        .expect("project registered");
+    assert!(bob.sync_project("proj").await.is_err());
+    assert!(bob.join_pending("proj"), "a failed sync must keep the park");
+
+    // the host comes back from disk, at a new address
+    let hoster_auth = ProjectAuth::load_or_new(&hoster_auth_id, &hoster_auth_dir)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let hoster = BeelayNode::bind_local(
+        &hoster_device,
+        &hoster_auth_id,
+        hoster_auth,
+        Some(&hoster_data),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        hoster
+            .auth()
+            .query_access("proj", bob_member)
+            .await
+            .map_err(anyhow::Error::msg)?,
+        Some(Role::Edit),
+        "the upgrade must survive the host restart"
+    );
+    // same code, re-pointed: re-minting would reseal and mask the upgrade
+    let invite = {
+        let bytes = ProjectInvite::from_str(&invite)?.encode_bytes();
+        let (_, id, beelay, keyhive, group): (
+            EndpointTicket,
+            String,
+            [u8; 16],
+            [u8; 32],
+            [u8; 32],
+        ) = postcard::from_bytes(&bytes)?;
+        let ticket = EndpointTicket::new(hoster.addr());
+        ProjectInvite::decode_bytes(&postcard::to_stdvec(&(ticket, id, beelay, keyhive, group))?)?
+            .to_string()
+    };
+    bob.accept_invite(&invite)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(
+        !bob.join_pending("proj"),
+        "a landed accept must drop the park"
+    );
+
+    // first sync fetches the host's content; bob's offline edit uploads with it
+    for _ in 0..2 {
+        let outcome = bob.sync_project("proj").await.map_err(anyhow::Error::msg)?;
+        assert!(
+            outcome.undecryptable.is_empty(),
+            "{:?}",
+            outcome.undecryptable
+        );
+    }
+    let bob_doc = bob.doc("proj").await.unwrap();
+    assert_eq!(
+        get_str(&bob_doc, "title").as_deref(),
+        Some("Promoted Offline")
+    );
+    assert_eq!(
+        get_str(&bob_doc, "bob_offline").as_deref(),
+        Some("written while host away"),
+        "the offline edit must survive the join"
+    );
+    let hoster_doc = hoster.doc("proj").await.unwrap();
+    assert_eq!(
+        get_str(&hoster_doc, "bob_offline").as_deref(),
+        Some("written while host away"),
+        "an upgraded editor's offline edit must reach the host"
+    );
+
+    for node in [hoster, bob] {
         node.shutdown().await.map_err(anyhow::Error::msg)?;
     }
     Ok(())
