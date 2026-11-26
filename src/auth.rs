@@ -179,11 +179,18 @@ impl DeviceBinding {
 
 /// Access level for a project member; maps 1:1 onto keyhive's `Access`.
 /// `Edit` implies `Read`; `Relay` may forward ciphertexts but not read them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Role {
+    #[serde(rename = "relay")]
     Relay,
+    #[serde(rename = "viewer")]
     Read,
+    #[serde(rename = "editor")]
     Edit,
+    #[serde(
+        rename(serialize = "co-admin", deserialize = "admin"),
+        alias = "co-admin"
+    )]
     Admin,
 }
 
